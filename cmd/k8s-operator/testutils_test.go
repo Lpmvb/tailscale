@@ -28,12 +28,18 @@ import (
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"tailscale.com/client/tailscale"
+	"tailscale.com/internal/client/tailscale"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
+	"tailscale.com/kube/kubetypes"
+	"tailscale.com/tailcfg"
 	"tailscale.com/types/ptr"
 	"tailscale.com/util/mak"
+)
+
+const (
+	vipTestIP = "5.6.7.8"
 )
 
 // confgOpts contains configuration options for creating cluster resources for
@@ -559,13 +565,30 @@ func expectedSecret(t *testing.T, cl client.Client, opts configOpts) *corev1.Sec
 	return s
 }
 
+func findNoGenName(t *testing.T, client client.Client, ns, name, typ string) {
+	t.Helper()
+	labels := map[string]string{
+		kubetypes.LabelManaged: "true",
+		LabelParentName:        name,
+		LabelParentNamespace:   ns,
+		LabelParentType:        typ,
+	}
+	s, err := getSingleObject[corev1.Secret](context.Background(), client, "operator-ns", labels)
+	if err != nil {
+		t.Fatalf("finding secrets for %q: %v", name, err)
+	}
+	if s != nil {
+		t.Fatalf("found unexpected secret with name %q", s.GetName())
+	}
+}
+
 func findGenName(t *testing.T, client client.Client, ns, name, typ string) (full, noSuffix string) {
 	t.Helper()
 	labels := map[string]string{
-		LabelManaged:         "true",
-		LabelParentName:      name,
-		LabelParentNamespace: ns,
-		LabelParentType:      typ,
+		kubetypes.LabelManaged: "true",
+		LabelParentName:        name,
+		LabelParentNamespace:   ns,
+		LabelParentType:        typ,
 	}
 	s, err := getSingleObject[corev1.Secret](context.Background(), client, "operator-ns", labels)
 	if err != nil {
@@ -581,6 +604,21 @@ func mustCreate(t *testing.T, client client.Client, obj client.Object) {
 	t.Helper()
 	if err := client.Create(context.Background(), obj); err != nil {
 		t.Fatalf("creating %q: %v", obj.GetName(), err)
+	}
+}
+func mustCreateAll(t *testing.T, client client.Client, objs ...client.Object) {
+	t.Helper()
+	for _, obj := range objs {
+		mustCreate(t, client, obj)
+	}
+}
+
+func mustDeleteAll(t *testing.T, client client.Client, objs ...client.Object) {
+	t.Helper()
+	for _, obj := range objs {
+		if err := client.Delete(context.Background(), obj); err != nil {
+			t.Fatalf("deleting %q: %v", obj.GetName(), err)
+		}
 	}
 }
 
@@ -706,6 +744,19 @@ func expectRequeue(t *testing.T, sr reconcile.Reconciler, ns, name string) {
 		t.Fatalf("expected timed requeue, got success")
 	}
 }
+func expectError(t *testing.T, sr reconcile.Reconciler, ns, name string) {
+	t.Helper()
+	req := reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      name,
+			Namespace: ns,
+		},
+	}
+	_, err := sr.Reconcile(context.Background(), req)
+	if err == nil {
+		t.Error("Reconcile: expected error but did not get one")
+	}
+}
 
 // expectEvents accepts a test recorder and a list of events, tests that expected
 // events are sent down the recorder's channel. Waits for 5s for each event.
@@ -739,7 +790,7 @@ type fakeTSClient struct {
 	sync.Mutex
 	keyRequests []tailscale.KeyCapabilities
 	deleted     []string
-	vipServices map[string]*VIPService
+	vipServices map[tailcfg.ServiceName]*tailscale.VIPService
 }
 type fakeTSNetServer struct {
 	certDomains []string
@@ -846,30 +897,44 @@ func removeAuthKeyIfExistsModifier(t *testing.T) func(s *corev1.Secret) {
 	}
 }
 
-func (c *fakeTSClient) getVIPServiceByName(ctx context.Context, name string) (*VIPService, error) {
+func (c *fakeTSClient) GetVIPService(ctx context.Context, name tailcfg.ServiceName) (*tailscale.VIPService, error) {
 	c.Lock()
 	defer c.Unlock()
 	if c.vipServices == nil {
-		return nil, &tailscale.ErrResponse{Status: http.StatusNotFound}
+		return nil, tailscale.ErrResponse{Status: http.StatusNotFound}
 	}
 	svc, ok := c.vipServices[name]
 	if !ok {
-		return nil, &tailscale.ErrResponse{Status: http.StatusNotFound}
+		return nil, tailscale.ErrResponse{Status: http.StatusNotFound}
 	}
 	return svc, nil
 }
 
-func (c *fakeTSClient) createOrUpdateVIPServiceByName(ctx context.Context, svc *VIPService) error {
+func (c *fakeTSClient) ListVIPServices(ctx context.Context) (map[tailcfg.ServiceName]*tailscale.VIPService, error) {
 	c.Lock()
 	defer c.Unlock()
 	if c.vipServices == nil {
-		c.vipServices = make(map[string]*VIPService)
+		return nil, &tailscale.ErrResponse{Status: http.StatusNotFound}
 	}
+	return c.vipServices, nil
+}
+
+func (c *fakeTSClient) CreateOrUpdateVIPService(ctx context.Context, svc *tailscale.VIPService) error {
+	c.Lock()
+	defer c.Unlock()
+	if c.vipServices == nil {
+		c.vipServices = make(map[tailcfg.ServiceName]*tailscale.VIPService)
+	}
+
+	if svc.Addrs == nil {
+		svc.Addrs = []string{vipTestIP}
+	}
+
 	c.vipServices[svc.Name] = svc
 	return nil
 }
 
-func (c *fakeTSClient) deleteVIPServiceByName(ctx context.Context, name string) error {
+func (c *fakeTSClient) DeleteVIPService(ctx context.Context, name tailcfg.ServiceName) error {
 	c.Lock()
 	defer c.Unlock()
 	if c.vipServices != nil {

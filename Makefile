@@ -17,22 +17,26 @@ lint: ## Run golangci-lint
 updatedeps: ## Update depaware deps
 	# depaware (via x/tools/go/packages) shells back to "go", so make sure the "go"
 	# it finds in its $$PATH is the right one.
-	PATH="$$(./tool/go env GOROOT)/bin:$$PATH" ./tool/go run github.com/tailscale/depaware --update \
+	PATH="$$(./tool/go env GOROOT)/bin:$$PATH" ./tool/go run github.com/tailscale/depaware --update --internal \
 		tailscale.com/cmd/tailscaled \
 		tailscale.com/cmd/tailscale \
 		tailscale.com/cmd/derper \
 		tailscale.com/cmd/k8s-operator \
 		tailscale.com/cmd/stund
+	PATH="$$(./tool/go env GOROOT)/bin:$$PATH" ./tool/go run github.com/tailscale/depaware --update -goos=linux,darwin,windows,android,ios --internal \
+		tailscale.com/tsnet
 
 depaware: ## Run depaware checks
 	# depaware (via x/tools/go/packages) shells back to "go", so make sure the "go"
 	# it finds in its $$PATH is the right one.
-	PATH="$$(./tool/go env GOROOT)/bin:$$PATH" ./tool/go run github.com/tailscale/depaware --check \
+	PATH="$$(./tool/go env GOROOT)/bin:$$PATH" ./tool/go run github.com/tailscale/depaware --check --internal \
 		tailscale.com/cmd/tailscaled \
 		tailscale.com/cmd/tailscale \
 		tailscale.com/cmd/derper \
 		tailscale.com/cmd/k8s-operator \
 		tailscale.com/cmd/stund
+	PATH="$$(./tool/go env GOROOT)/bin:$$PATH" ./tool/go run github.com/tailscale/depaware --check --goos=linux,darwin,windows,android,ios --internal \
+		tailscale.com/tsnet
 
 buildwindows: ## Build tailscale CLI for windows/amd64
 	GOOS=windows GOARCH=amd64 ./tool/go install tailscale.com/cmd/tailscale tailscale.com/cmd/tailscaled

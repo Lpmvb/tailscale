@@ -11,6 +11,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	crand "crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/binary"
@@ -23,7 +24,6 @@ import (
 	"math"
 	"math/big"
 	"math/rand/v2"
-	"net"
 	"net/http"
 	"net/netip"
 	"os"
@@ -37,7 +37,9 @@ import (
 
 	"go4.org/mem"
 	"golang.org/x/sync/errgroup"
+	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale"
+	"tailscale.com/derp/derpconst"
 	"tailscale.com/disco"
 	"tailscale.com/envknob"
 	"tailscale.com/metrics"
@@ -85,7 +87,7 @@ func init() {
 
 const (
 	defaultPerClientSendQueueDepth = 32 // default packets buffered for sending
-	writeTimeout                   = 2 * time.Second
+	DefaultTCPWiteTimeout          = 2 * time.Second
 	privilegedWriteTimeout         = 30 * time.Second // for clients with the mesh key
 )
 
@@ -137,6 +139,7 @@ type Server struct {
 	metaCert    []byte // the encoded x509 cert to send after LetsEncrypt cert+intermediate
 	dupPolicy   dupPolicy
 	debug       bool
+	localClient local.Client
 
 	// Counters:
 	packetsSent, bytesSent     expvar.Int
@@ -201,6 +204,8 @@ type Server struct {
 
 	// Sets the client send queue depth for the server.
 	perClientSendQueueDepth int
+
+	tcpWriteTimeout time.Duration
 
 	clock tstime.Clock
 }
@@ -341,17 +346,6 @@ type PacketForwarder interface {
 	String() string
 }
 
-// Conn is the subset of the underlying net.Conn the DERP Server needs.
-// It is a defined type so that non-net connections can be used.
-type Conn interface {
-	io.WriteCloser
-	LocalAddr() net.Addr
-	// The *Deadline methods follow the semantics of net.Conn.
-	SetDeadline(time.Time) error
-	SetReadDeadline(time.Time) error
-	SetWriteDeadline(time.Time) error
-}
-
 var packetsDropped = metrics.NewMultiLabelMap[dropReasonKindLabels](
 	"derp_packets_dropped",
 	"counter",
@@ -389,6 +383,7 @@ func NewServer(privateKey key.NodePrivate, logf logger.Logf) *Server {
 		bufferedWriteFrames: metrics.NewHistogram([]float64{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 25, 50, 100}),
 		keyOfAddr:           map[netip.AddrPort]key.NodePublic{},
 		clock:               tstime.StdClock{},
+		tcpWriteTimeout:     DefaultTCPWiteTimeout,
 	}
 	s.initMetacert()
 	s.packetsRecvDisco = s.packetsRecvByKind.Get(string(packetKindDisco))
@@ -491,6 +486,23 @@ func (s *Server) SetVerifyClientURL(v string) {
 // admission controller URL is unreachable.
 func (s *Server) SetVerifyClientURLFailOpen(v bool) {
 	s.verifyClientsURLFailOpen = v
+}
+
+// SetTailscaledSocketPath sets the unix socket path to use to talk to
+// tailscaled if client verification is enabled.
+//
+// If unset or set to the empty string, the default path for the operating
+// system is used.
+func (s *Server) SetTailscaledSocketPath(path string) {
+	s.localClient.Socket = path
+	s.localClient.UseSocketOnly = path != ""
+}
+
+// SetTCPWriteTimeout sets the timeout for writing to connected clients.
+// This timeout does not apply to mesh connections.
+// Defaults to 2 seconds.
+func (s *Server) SetTCPWriteTimeout(d time.Duration) {
+	s.tcpWriteTimeout = d
 }
 
 // HasMeshKey reports whether the server is configured with a mesh key.
@@ -606,7 +618,7 @@ func (s *Server) initMetacert() {
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(ProtocolVersion),
 		Subject: pkix.Name{
-			CommonName: fmt.Sprintf("derpkey%s", s.publicKey.UntypedHexString()),
+			CommonName: derpconst.MetaCertCommonNamePrefix + s.publicKey.UntypedHexString(),
 		},
 		// Windows requires NotAfter and NotBefore set:
 		NotAfter:  s.clock.Now().Add(30 * 24 * time.Hour),
@@ -625,6 +637,25 @@ func (s *Server) initMetacert() {
 // MetaCert returns the server metadata cert that can be sent by the
 // TLS server to let the client skip a round trip during start-up.
 func (s *Server) MetaCert() []byte { return s.metaCert }
+
+// ModifyTLSConfigToAddMetaCert modifies c.GetCertificate to make
+// it append s.MetaCert to the returned certificates.
+//
+// It panics if c or c.GetCertificate is nil.
+func (s *Server) ModifyTLSConfigToAddMetaCert(c *tls.Config) {
+	getCert := c.GetCertificate
+	if getCert == nil {
+		panic("c.GetCertificate is nil")
+	}
+	c.GetCertificate = func(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		cert, err := getCert(hi)
+		if err != nil {
+			return nil, err
+		}
+		cert.Certificate = append(cert.Certificate, s.MetaCert())
+		return cert, nil
+	}
+}
 
 // registerClient notes that client c is now authenticated and ready for packets.
 //
@@ -1321,8 +1352,6 @@ func (c *sclient) requestMeshUpdate() {
 	}
 }
 
-var localClient tailscale.LocalClient
-
 // isMeshPeer reports whether the client is a trusted mesh peer
 // node in the DERP region.
 func (s *Server) isMeshPeer(info *clientInfo) bool {
@@ -1341,7 +1370,7 @@ func (s *Server) verifyClient(ctx context.Context, clientKey key.NodePublic, inf
 
 	// tailscaled-based verification:
 	if s.verifyClientsLocalTailscaled {
-		_, err := localClient.WhoIsNodeKey(ctx, clientKey)
+		_, err := s.localClient.WhoIsNodeKey(ctx, clientKey)
 		if err == tailscale.ErrPeerNotFound {
 			return fmt.Errorf("peer %v not authorized (not found in local tailscaled)", clientKey)
 		}
@@ -1817,7 +1846,7 @@ func (c *sclient) sendLoop(ctx context.Context) error {
 }
 
 func (c *sclient) setWriteDeadline() {
-	d := writeTimeout
+	d := c.s.tcpWriteTimeout
 	if c.canMesh {
 		// Trusted peers get more tolerance.
 		//
@@ -1829,7 +1858,18 @@ func (c *sclient) setWriteDeadline() {
 		// of connected peers.
 		d = privilegedWriteTimeout
 	}
-	c.nc.SetWriteDeadline(time.Now().Add(d))
+	if d == 0 {
+		// A zero value should disable the write deadline per
+		// --tcp-write-timeout docs. The flag should only be applicable for
+		// non-mesh connections, again per its docs. If mesh happened to use a
+		// zero value constant above it would be a bug, so we don't bother
+		// with a condition on c.canMesh.
+		return
+	}
+	// Ignore the error from setting the write deadline. In practice,
+	// setting the deadline will only fail if the connection is closed
+	// or closing, so the subsequent Write() will fail anyway.
+	_ = c.nc.SetWriteDeadline(time.Now().Add(d))
 }
 
 // sendKeepAlive sends a keep-alive frame, without flushing.
@@ -2230,7 +2270,7 @@ func (s *Server) ConsistencyCheck() error {
 func (s *Server) checkVerifyClientsLocalTailscaled() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	status, err := localClient.StatusWithoutPeers(ctx)
+	status, err := s.localClient.StatusWithoutPeers(ctx)
 	if err != nil {
 		return fmt.Errorf("localClient.Status: %w", err)
 	}

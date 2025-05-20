@@ -50,7 +50,7 @@ jobs:
           - shard: '4/4'
     steps:
     - name: checkout
-      uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
     - name: build test wrapper
       run: ./tool/go build -o /tmp/testwrapper ./cmd/testwrapper
     - name: integration tests as root
@@ -64,7 +64,6 @@ jobs:
       matrix:
         include:
           - goarch: amd64
-            coverflags: "-coverprofile=/tmp/coverage.out"
           - goarch: amd64
             buildflags: "-race"
             shard: '1/3'
@@ -78,9 +77,9 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
     - name: checkout
-      uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
     - name: Restore Cache
-      uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+      uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
       with:
         # Note: unlike the other setups, this is only grabbing the mod download
         # cache, rather than the whole mod directory, as the download cache
@@ -119,15 +118,10 @@ jobs:
     - name: build test wrapper
       run: ./tool/go build -o /tmp/testwrapper ./cmd/testwrapper
     - name: test all
-      run: NOBASHDEBUG=true PATH=$PWD/tool:$PATH /tmp/testwrapper ${{matrix.coverflags}} ./... ${{matrix.buildflags}}
+      run: NOBASHDEBUG=true PATH=$PWD/tool:$PATH /tmp/testwrapper ./... ${{matrix.buildflags}}
       env:
         GOARCH: ${{ matrix.goarch }}
         TS_TEST_SHARD: ${{ matrix.shard }}
-    - name: Publish to coveralls.io
-      if: matrix.coverflags != '' # only publish results if we've tracked coverage
-      uses: shogo82148/actions-goveralls@v1
-      with:
-        path-to-profile: /tmp/coverage.out
     - name: bench all
       run: ./tool/go test ${{matrix.buildflags}} -bench=. -benchtime=1x -run=^$ $(for x in $(git grep -l "^func Benchmark" | xargs dirname | sort | uniq); do echo "./$x"; done)
       env:
@@ -145,21 +139,25 @@ jobs:
           echo "Build/test created untracked files in the repo (file names above)."
           exit 1
         fi
-
+    - name: Tidy cache
+      shell: bash
+      run: |
+        find $(go env GOCACHE) -type f -mmin +90 -delete
+        find $(go env GOMODCACHE)/cache -type f -mmin +90 -delete
   windows:
     runs-on: windows-2022
     steps:
     - name: checkout
-      uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
     - name: Install Go
-      uses: actions/setup-go@3041bf56c941b39c61721a86cd11f3bb1338122a # v5.2.0
+      uses: actions/setup-go@0aaccfd150d50ccaeb58ebd88d36e91967a5f35b # v5.4.0
       with:
         go-version-file: go.mod
         cache: false
 
     - name: Restore Cache
-      uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+      uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
       with:
         # Note: unlike the other setups, this is only grabbing the mod download
         # cache, rather than the whole mod directory, as the download cache
@@ -182,6 +180,11 @@ jobs:
       # Somewhere in the layers (powershell?)
       # the equals signs cause great confusion.
       run: go test ./... -bench . -benchtime 1x -run "^$"
+    - name: Tidy cache
+      shell: bash
+      run: |
+        find $(go env GOCACHE) -type f -mmin +90 -delete
+        find $(go env GOMODCACHE)/cache -type f -mmin +90 -delete
 
   privileged:
     runs-on: ubuntu-22.04
@@ -190,7 +193,7 @@ jobs:
       options: --privileged
     steps:
     - name: checkout
-      uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
     - name: chown
       run: chown -R $(id -u):$(id -g) $PWD
     - name: privileged tests
@@ -202,7 +205,7 @@ jobs:
     if: github.repository == 'tailscale/tailscale'
     steps:
     - name: checkout
-      uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
     - name: Run VM tests
       run: ./tool/go test ./tstest/integration/vms -v -no-s3 -run-vm-tests -run=TestRunUbuntu2004
       env:
@@ -214,7 +217,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
     - name: checkout
-      uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
     - name: build all
       run: ./tool/go install -race ./cmd/...
     - name: build tests
@@ -258,9 +261,9 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
     - name: checkout
-      uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
     - name: Restore Cache
-      uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+      uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
       with:
         # Note: unlike the other setups, this is only grabbing the mod download
         # cache, rather than the whole mod directory, as the download cache
@@ -289,13 +292,18 @@ jobs:
         GOOS: ${{ matrix.goos }}
         GOARCH: ${{ matrix.goarch }}
         CGO_ENABLED: "0"
+    - name: Tidy cache
+      shell: bash
+      run: |
+        find $(go env GOCACHE) -type f -mmin +90 -delete
+        find $(go env GOMODCACHE)/cache -type f -mmin +90 -delete
 
   ios: # similar to cross above, but iOS can't build most of the repo. So, just
        #make it build a few smoke packages.
     runs-on: ubuntu-22.04
     steps:
     - name: checkout
-      uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
     - name: build some
       run: ./tool/go build ./ipn/... ./wgengine/ ./types/... ./control/controlclient
       env:
@@ -323,9 +331,9 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
     - name: checkout
-      uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
     - name: Restore Cache
-      uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+      uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
       with:
         # Note: unlike the other setups, this is only grabbing the mod download
         # cache, rather than the whole mod directory, as the download cache
@@ -348,6 +356,11 @@ jobs:
         GOARCH: ${{ matrix.goarch }}
         GOARM: ${{ matrix.goarm }}
         CGO_ENABLED: "0"
+    - name: Tidy cache
+      shell: bash
+      run: |
+        find $(go env GOCACHE) -type f -mmin +90 -delete
+        find $(go env GOMODCACHE)/cache -type f -mmin +90 -delete
 
   android:
     # similar to cross above, but android fails to build a few pieces of the
@@ -356,7 +369,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
     - name: checkout
-      uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       # Super minimal Android build that doesn't even use CGO and doesn't build everything that's needed
       # and is only arm64. But it's a smoke build: it's not meant to catch everything. But it'll catch
       # some Android breakages early.
@@ -371,9 +384,9 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
     - name: checkout
-      uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
     - name: Restore Cache
-      uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+      uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
       with:
         # Note: unlike the other setups, this is only grabbing the mod download
         # cache, rather than the whole mod directory, as the download cache
@@ -400,12 +413,17 @@ jobs:
       run: |
         ./tool/go run ./cmd/tsconnect --fast-compression build
         ./tool/go run ./cmd/tsconnect --fast-compression build-pkg
+    - name: Tidy cache
+      shell: bash
+      run: |
+        find $(go env GOCACHE) -type f -mmin +90 -delete
+        find $(go env GOMODCACHE)/cache -type f -mmin +90 -delete
 
   tailscale_go: # Subset of tests that depend on our custom Go toolchain.
     runs-on: ubuntu-22.04
     steps:
     - name: checkout
-      uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
     - name: test tailscale_go
       run: ./tool/go test -tags=tailscale_go,ts_enable_sockstats ./net/sockstats/...
 
@@ -467,7 +485,7 @@ jobs:
       run: |
         echo "artifacts_path=$(realpath .)" >> $GITHUB_ENV
     - name: upload crash
-      uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       if: steps.run.outcome != 'success' && steps.build.outcome == 'success'
       with:
         name: artifacts
@@ -477,17 +495,16 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
     - name: checkout
-      uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
     - name: check depaware
       run: |
-        export PATH=$(./tool/go env GOROOT)/bin:$PATH
-        find . -name 'depaware.txt' | xargs -n1 dirname | xargs ./tool/go run github.com/tailscale/depaware --check
+        make depaware
 
   go_generate:
     runs-on: ubuntu-22.04
     steps:
     - name: checkout
-      uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
     - name: check that 'go generate' is clean
       run: |
         pkgs=$(./tool/go list ./... | grep -Ev 'dnsfallback|k8s-operator|xdp')
@@ -500,7 +517,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
     - name: checkout
-      uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
     - name: check that 'go mod tidy' is clean
       run: |
         ./tool/go mod tidy
@@ -512,7 +529,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
     - name: checkout
-      uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
     - name: check licenses
       run: ./scripts/check_license_headers.sh .
 
@@ -528,7 +545,7 @@ jobs:
             goarch: "386"
     steps:
     - name: checkout
-      uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
     - name: install staticcheck
       run: GOBIN=~/.local/bin ./tool/go install honnef.co/go/tools/cmd/staticcheck
     - name: run staticcheck
@@ -569,8 +586,10 @@ jobs:
       # By having the job always run, but skipping its only step as needed, we
       # let the CI output collapse nicely in PRs.
       if: failure() && github.event_name == 'push'
-      uses: slackapi/slack-github-action@37ebaef184d7626c5f204ab8d3baff4262dd30f0 # v1.27.0
+      uses: slackapi/slack-github-action@485a9d42d3a73031f12ec201c457e2162c45d02d # v2.0.0
       with:
+        webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+        webhook-type: incoming-webhook
         payload: |
           {
             "attachments": [{
@@ -582,9 +601,6 @@ jobs:
               "color": "danger"
             }]
           }
-      env:
-        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
 
   check_mergeability:
     if: always()

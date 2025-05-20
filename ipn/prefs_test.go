@@ -65,6 +65,7 @@ func TestPrefsEqual(t *testing.T) {
 		"PostureChecking",
 		"NetfilterKind",
 		"DriveShares",
+		"RelayServerPort",
 		"AllowSingleHosts",
 		"Persist",
 	}
@@ -73,6 +74,9 @@ func TestPrefsEqual(t *testing.T) {
 			have, prefsHandles)
 	}
 
+	relayServerPort := func(port int) *int {
+		return &port
+	}
 	nets := func(strs ...string) (ns []netip.Prefix) {
 		for _, s := range strs {
 			n, err := netip.ParsePrefix(s)
@@ -341,6 +345,16 @@ func TestPrefsEqual(t *testing.T) {
 			&Prefs{AdvertiseServices: []string{"svc:tux", "svc:amelie"}},
 			false,
 		},
+		{
+			&Prefs{RelayServerPort: relayServerPort(0)},
+			&Prefs{RelayServerPort: nil},
+			false,
+		},
+		{
+			&Prefs{RelayServerPort: relayServerPort(0)},
+			&Prefs{RelayServerPort: relayServerPort(1)},
+			false,
+		},
 	}
 	for i, tt := range tests {
 		got := tt.a.Equals(tt.b)
@@ -469,19 +483,12 @@ func TestPrefsPretty(t *testing.T) {
 		},
 		{
 			Prefs{
-				Persist: &persist.Persist{},
-			},
-			"linux",
-			`Prefs{ra=false dns=false want=false routes=[] nf=off update=off Persist{lm=, o=, n= u=""}}`,
-		},
-		{
-			Prefs{
 				Persist: &persist.Persist{
 					PrivateNodeKey: key.NodePrivateFromRaw32(mem.B([]byte{1: 1, 31: 0})),
 				},
 			},
 			"linux",
-			`Prefs{ra=false dns=false want=false routes=[] nf=off update=off Persist{lm=, o=, n=[B1VKl] u=""}}`,
+			`Prefs{ra=false dns=false want=false routes=[] nf=off update=off Persist{o=, n=[B1VKl] u=""}}`,
 		},
 		{
 			Prefs{

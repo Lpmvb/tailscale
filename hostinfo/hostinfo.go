@@ -21,6 +21,7 @@ import (
 	"go4.org/mem"
 	"tailscale.com/envknob"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/lazy"
 	"tailscale.com/types/opt"
 	"tailscale.com/types/ptr"
 	"tailscale.com/util/cloudenv"
@@ -32,11 +33,19 @@ import (
 
 var started = time.Now()
 
+var newHooks []func(*tailcfg.Hostinfo)
+
+// RegisterHostinfoNewHook registers a callback to be called on a non-nil
+// [tailcfg.Hostinfo] before it is returned by [New].
+func RegisterHostinfoNewHook(f func(*tailcfg.Hostinfo)) {
+	newHooks = append(newHooks, f)
+}
+
 // New returns a partially populated Hostinfo for the current host.
 func New() *tailcfg.Hostinfo {
-	hostname, _ := os.Hostname()
+	hostname, _ := Hostname()
 	hostname = dnsname.FirstLabel(hostname)
-	return &tailcfg.Hostinfo{
+	hi := &tailcfg.Hostinfo{
 		IPNVersion:      version.Long(),
 		Hostname:        hostname,
 		App:             appTypeCached(),
@@ -57,8 +66,11 @@ func New() *tailcfg.Hostinfo {
 		Cloud:           string(cloudenv.Get()),
 		NoLogsNoSupport: envknob.NoLogsNoSupport(),
 		AllowsUpdate:    envknob.AllowsRemoteUpdate(),
-		WoLMACs:         getWoLMACs(),
 	}
+	for _, f := range newHooks {
+		f(hi)
+	}
+	return hi
 }
 
 // non-nil on some platforms
@@ -486,5 +498,32 @@ func IsNATLabGuestVM() bool {
 	return false
 }
 
-// NAT Lab VMs have a unique MAC address prefix.
-// See
+const copyV86DeviceModel = "copy-v86"
+
+var isV86Cache lazy.SyncValue[bool]
+
+// IsInVM86 reports whether we're running in the copy/v86 wasm emulator,
+// https://github.com/copy/v86/.
+func IsInVM86() bool {
+	return isV86Cache.Get(func() bool {
+		return New().DeviceModel == copyV86DeviceModel
+	})
+}
+
+type hostnameQuery func() (string, error)
+
+var hostnameFn atomic.Value // of func() (string, error)
+
+// SetHostNameFn sets a custom function for querying the system hostname.
+func SetHostnameFn(fn hostnameQuery) {
+	hostnameFn.Store(fn)
+}
+
+// Hostname returns the system hostname using the function
+// set by SetHostNameFn.  We will fallback to os.Hostname.
+func Hostname() (string, error) {
+	if fn, ok := hostnameFn.Load().(hostnameQuery); ok && fn != nil {
+		return fn()
+	}
+	return os.Hostname()
+}

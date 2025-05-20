@@ -17,6 +17,7 @@ import (
 
 	qt "github.com/frankban/quicktest"
 	"github.com/google/go-cmp/cmp"
+	"github.com/peterbourgon/ff/v3/ffcli"
 	"tailscale.com/envknob"
 	"tailscale.com/health/healthmsg"
 	"tailscale.com/ipn"
@@ -24,10 +25,12 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/tka"
 	"tailscale.com/tstest"
+	"tailscale.com/tstest/deptest"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/opt"
 	"tailscale.com/types/persist"
 	"tailscale.com/types/preftype"
+	"tailscale.com/util/set"
 	"tailscale.com/version/distro"
 )
 
@@ -602,7 +605,7 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 			want: "",
 		},
 		{
-			name:  "losing_posture_checking",
+			name:  "losing_report_posture",
 			flags: []string{"--accept-dns"},
 			curPrefs: &ipn.Prefs{
 				ControlURL:          ipn.DefaultControlURL,
@@ -612,7 +615,7 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 				NetfilterMode:       preftype.NetfilterOn,
 				NoStatefulFiltering: opt.NewBool(true),
 			},
-			want: accidentalUpPrefix + " --accept-dns --posture-checking",
+			want: accidentalUpPrefix + " --accept-dns --report-posture",
 		},
 	}
 	for _, tt := range tests {
@@ -1391,23 +1394,28 @@ var cmpIP = cmp.Comparer(func(a, b netip.Addr) bool {
 })
 
 func TestCleanUpArgs(t *testing.T) {
+	type S = []string
 	c := qt.New(t)
 	tests := []struct {
 		in   []string
 		want []string
 	}{
-		{in: []string{"something"}, want: []string{"something"}},
-		{in: []string{}, want: []string{}},
-		{in: []string{"--authkey=0"}, want: []string{"--auth-key=0"}},
-		{in: []string{"a", "--authkey=1", "b"}, want: []string{"a", "--auth-key=1", "b"}},
-		{in: []string{"a", "--auth-key=2", "b"}, want: []string{"a", "--auth-key=2", "b"}},
-		{in: []string{"a", "-authkey=3", "b"}, want: []string{"a", "--auth-key=3", "b"}},
-		{in: []string{"a", "-auth-key=4", "b"}, want: []string{"a", "-auth-key=4", "b"}},
-		{in: []string{"a", "--authkey", "5", "b"}, want: []string{"a", "--auth-key", "5", "b"}},
-		{in: []string{"a", "-authkey", "6", "b"}, want: []string{"a", "--auth-key", "6", "b"}},
-		{in: []string{"a", "authkey", "7", "b"}, want: []string{"a", "authkey", "7", "b"}},
-		{in: []string{"--authkeyexpiry", "8"}, want: []string{"--authkeyexpiry", "8"}},
-		{in: []string{"--auth-key-expiry", "9"}, want: []string{"--auth-key-expiry", "9"}},
+		{in: S{"something"}, want: S{"something"}},
+		{in: S{}, want: S{}},
+		{in: S{"--authkey=0"}, want: S{"--auth-key=0"}},
+		{in: S{"a", "--authkey=1", "b"}, want: S{"a", "--auth-key=1", "b"}},
+		{in: S{"a", "--auth-key=2", "b"}, want: S{"a", "--auth-key=2", "b"}},
+		{in: S{"a", "-authkey=3", "b"}, want: S{"a", "--auth-key=3", "b"}},
+		{in: S{"a", "-auth-key=4", "b"}, want: S{"a", "-auth-key=4", "b"}},
+		{in: S{"a", "--authkey", "5", "b"}, want: S{"a", "--auth-key", "5", "b"}},
+		{in: S{"a", "-authkey", "6", "b"}, want: S{"a", "--auth-key", "6", "b"}},
+		{in: S{"a", "authkey", "7", "b"}, want: S{"a", "authkey", "7", "b"}},
+		{in: S{"--authkeyexpiry", "8"}, want: S{"--authkeyexpiry", "8"}},
+		{in: S{"--auth-key-expiry", "9"}, want: S{"--auth-key-expiry", "9"}},
+
+		{in: S{"--posture-checking"}, want: S{"--report-posture"}},
+		{in: S{"-posture-checking"}, want: S{"--report-posture"}},
+		{in: S{"--posture-checking=nein"}, want: S{"--report-posture=nein"}},
 	}
 
 	for _, tt := range tests {
@@ -1496,6 +1504,51 @@ func TestParseNLArgs(t *testing.T) {
 	}
 }
 
+// makeQuietContinueOnError modifies c recursively to make all the
+// flagsets have error mode flag.ContinueOnError and not
+// spew all over stderr.
+func makeQuietContinueOnError(c *ffcli.Command) {
+	if c.FlagSet != nil {
+		c.FlagSet.Init(c.Name, flag.ContinueOnError)
+		c.FlagSet.Usage = func() {}
+		c.FlagSet.SetOutput(io.Discard)
+	}
+	c.UsageFunc = func(*ffcli.Command) string { return "" }
+	for _, sub := range c.Subcommands {
+		makeQuietContinueOnError(sub)
+	}
+}
+
+// see tailscale/tailscale#6813
+func TestNoDups(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "dup-boolean",
+			args: []string{"up", "--json", "--json"},
+			want: "error parsing commandline arguments: invalid boolean flag json: flag provided multiple times",
+		},
+		{
+			name: "dup-string",
+			args: []string{"up", "--hostname=foo", "--hostname=bar"},
+			want: "error parsing commandline arguments: invalid value \"bar\" for flag -hostname: flag provided multiple times",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd := newRootCmd()
+			makeQuietContinueOnError(cmd)
+			err := cmd.Parse(tt.args)
+			if got := fmt.Sprint(err); got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestHelpAlias(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	tstest.Replace[io.Writer](t, &Stdout, &stdout)
@@ -1524,4 +1577,74 @@ func TestHelpAlias(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
+}
+
+func TestDocs(t *testing.T) {
+	root := newRootCmd()
+	check := func(t *testing.T, c *ffcli.Command) {
+		shortVerb, _, ok := strings.Cut(c.ShortHelp, " ")
+		if !ok || shortVerb == "" {
+			t.Errorf("couldn't find verb+space in ShortHelp")
+		} else {
+			if strings.HasSuffix(shortVerb, ".") {
+				t.Errorf("ShortHelp shouldn't end in period; got %q", c.ShortHelp)
+			}
+			if b := shortVerb[0]; b >= 'a' && b <= 'z' {
+				t.Errorf("ShortHelp should start with upper-case letter; got %q", c.ShortHelp)
+			}
+			if strings.HasSuffix(shortVerb, "s") && shortVerb != "Does" {
+				t.Errorf("verb %q ending in 's' is unexpected, from %q", shortVerb, c.ShortHelp)
+			}
+		}
+
+		name := t.Name()
+		wantPfx := strings.ReplaceAll(strings.TrimPrefix(name, "TestDocs/"), "/", " ")
+		switch name {
+		case "TestDocs/tailscale/completion/bash",
+			"TestDocs/tailscale/completion/zsh":
+			wantPfx = "" // special-case exceptions
+		}
+		if !strings.HasPrefix(c.ShortUsage, wantPfx) {
+			t.Errorf("ShortUsage should start with %q; got %q", wantPfx, c.ShortUsage)
+		}
+	}
+
+	var walk func(t *testing.T, c *ffcli.Command)
+	walk = func(t *testing.T, c *ffcli.Command) {
+		t.Run(c.Name, func(t *testing.T) {
+			check(t, c)
+			for _, sub := range c.Subcommands {
+				walk(t, sub)
+			}
+		})
+	}
+	walk(t, root)
+}
+
+func TestDeps(t *testing.T) {
+	deptest.DepChecker{
+		GOOS:   "linux",
+		GOARCH: "arm64",
+		WantDeps: set.Of(
+			"tailscale.com/feature/capture/dissector", // want the Lua by default
+		),
+		BadDeps: map[string]string{
+			"tailscale.com/feature/capture": "don't link capture code",
+			"tailscale.com/net/packet":      "why we passing packets in the CLI?",
+			"tailscale.com/net/flowtrack":   "why we tracking flows in the CLI?",
+		},
+	}.Check(t)
+}
+
+func TestDepsNoCapture(t *testing.T) {
+	deptest.DepChecker{
+		GOOS:   "linux",
+		GOARCH: "arm64",
+		Tags:   "ts_omit_capture",
+		BadDeps: map[string]string{
+			"tailscale.com/feature/capture":           "don't link capture code",
+			"tailscale.com/feature/capture/dissector": "don't like the Lua",
+		},
+	}.Check(t)
+
 }

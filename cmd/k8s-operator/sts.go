@@ -44,11 +44,9 @@ const (
 	// Labels that the operator sets on StatefulSets and Pods. If you add a
 	// new label here, do also add it to tailscaleManagedLabels var to
 	// ensure that it does not get overwritten by ProxyClass configuration.
-	LabelManaged         = "tailscale.com/managed"
 	LabelParentType      = "tailscale.com/parent-resource-type"
 	LabelParentName      = "tailscale.com/parent-resource"
 	LabelParentNamespace = "tailscale.com/parent-resource-ns"
-	labelSecretType      = "tailscale.com/secret-type" // "config" or "state".
 
 	// LabelProxyClass can be set by users on tailscale Ingresses and Services that define cluster ingress or
 	// cluster egress, to specify that configuration in this ProxyClass should be applied to resources created for
@@ -101,11 +99,16 @@ const (
 	proxyTypeIngressResource = "ingress_resource"
 	proxyTypeConnector       = "connector"
 	proxyTypeProxyGroup      = "proxygroup"
+
+	envVarTSLocalAddrPort = "TS_LOCAL_ADDR_PORT"
+	defaultLocalAddrPort  = 9002 // metrics and health check port
+
+	letsEncryptStagingEndpoint = "https://acme-staging-v02.api.letsencrypt.org/directory"
 )
 
 var (
 	// tailscaleManagedLabels are label keys that tailscale operator sets on StatefulSets and Pods.
-	tailscaleManagedLabels = []string{LabelManaged, LabelParentType, LabelParentName, LabelParentNamespace, "app"}
+	tailscaleManagedLabels = []string{kubetypes.LabelManaged, LabelParentType, LabelParentName, LabelParentNamespace, "app"}
 	// tailscaleManagedAnnotations are annotation keys that tailscale operator sets on StatefulSets and Pods.
 	tailscaleManagedAnnotations = []string{podAnnotationLastSetClusterIP, podAnnotationLastSetTailnetTargetIP, podAnnotationLastSetTailnetTargetFQDN, podAnnotationLastSetConfigFileHash}
 )
@@ -694,7 +697,7 @@ func (a *tailscaleSTSReconciler) reconcileSTS(ctx context.Context, logger *zap.S
 		// being created, there is no need for a restart.
 		// TODO(irbekrm): remove this in 1.84.
 		hash := tsConfigHash
-		if dev != nil && dev.capver >= 110 {
+		if dev == nil || dev.capver >= 110 {
 			hash = s.Spec.Template.GetAnnotations()[podAnnotationLastSetConfigFileHash]
 		}
 		s.Spec = ss.Spec
@@ -780,6 +783,17 @@ func applyProxyClassToStatefulSet(pc *tsapi.ProxyClass, ss *appsv1.StatefulSet, 
 			logger.Info("ProxyClass specifies that metrics should be enabled, but this is currently not supported for Ingress proxies that accept cluster traffic.")
 		} else {
 			enableEndpoints(ss, metricsEnabled, debugEnabled)
+		}
+	}
+	if pc.Spec.UseLetsEncryptStagingEnvironment && (stsCfg.proxyType == proxyTypeIngressResource || stsCfg.proxyType == string(tsapi.ProxyGroupTypeIngress)) {
+		for i, c := range ss.Spec.Template.Spec.Containers {
+			if c.Name == "tailscale" {
+				ss.Spec.Template.Spec.Containers[i].Env = append(ss.Spec.Template.Spec.Containers[i].Env, corev1.EnvVar{
+					Name:  "TS_DEBUG_ACME_DIRECTORY_URL",
+					Value: letsEncryptStagingEndpoint,
+				})
+				break
+			}
 		}
 	}
 
@@ -1038,13 +1052,13 @@ func tailscaledConfigHash(c tailscaledConfigs) (string, error) {
 	return fmt.Sprintf("%x", h.Sum(nil)), nil
 }
 
-// createOrUpdate adds obj to the k8s cluster, unless the object already exists,
-// in which case update is called to make changes to it. If update is nil, the
-// existing object is returned unmodified.
+// createOrMaybeUpdate adds obj to the k8s cluster, unless the object already exists,
+// in which case update is called to make changes to it. If update is nil or returns
+// an error, the object is returned unmodified.
 //
 // obj is looked up by its Name and Namespace if Name is set, otherwise it's
 // looked up by labels.
-func createOrUpdate[T any, O ptrObject[T]](ctx context.Context, c client.Client, ns string, obj O, update func(O)) (O, error) {
+func createOrMaybeUpdate[T any, O ptrObject[T]](ctx context.Context, c client.Client, ns string, obj O, update func(O) error) (O, error) {
 	var (
 		existing O
 		err      error
@@ -1059,7 +1073,9 @@ func createOrUpdate[T any, O ptrObject[T]](ctx context.Context, c client.Client,
 	}
 	if err == nil && existing != nil {
 		if update != nil {
-			update(existing)
+			if err := update(existing); err != nil {
+				return nil, err
+			}
 			if err := c.Update(ctx, existing); err != nil {
 				return nil, err
 			}
@@ -1073,6 +1089,21 @@ func createOrUpdate[T any, O ptrObject[T]](ctx context.Context, c client.Client,
 		return nil, err
 	}
 	return obj, nil
+}
+
+// createOrUpdate adds obj to the k8s cluster, unless the object already exists,
+// in which case update is called to make changes to it. If update is nil, the
+// existing object is returned unmodified.
+//
+// obj is looked up by its Name and Namespace if Name is set, otherwise it's
+// looked up by labels.
+func createOrUpdate[T any, O ptrObject[T]](ctx context.Context, c client.Client, ns string, obj O, update func(O)) (O, error) {
+	return createOrMaybeUpdate(ctx, c, ns, obj, func(o O) error {
+		if update != nil {
+			update(o)
+		}
+		return nil
+	})
 }
 
 // getSingleObject searches for k8s objects of type T

@@ -76,10 +76,9 @@ type NetworkMap struct {
 	// If this is empty, then data-plane audit logging is disabled.
 	DomainAuditLogID string
 
-	UserProfiles map[tailcfg.UserID]tailcfg.UserProfile
-
-	// MaxKeyDuration describes the MaxKeyDuration setting for the tailnet.
-	MaxKeyDuration time.Duration
+	// UserProfiles contains the profile information of UserIDs referenced
+	// in SelfNode and Peers.
+	UserProfiles map[tailcfg.UserID]tailcfg.UserProfileView
 }
 
 // User returns nm.SelfNode.User if nm.SelfNode is non-nil, otherwise it returns
@@ -99,6 +98,62 @@ func (nm *NetworkMap) GetAddresses() views.Slice[netip.Prefix] {
 		return zero
 	}
 	return nm.SelfNode.Addresses()
+}
+
+// GetVIPServiceIPMap returns a map of service names to the slice of
+// VIP addresses that correspond to the service. The service names are
+// with the prefix "svc:".
+//
+// TODO(tailscale/corp##25997): cache the result of decoding the capmap so that
+// we don't have to decode it multiple times after each netmap update.
+func (nm *NetworkMap) GetVIPServiceIPMap() tailcfg.ServiceIPMappings {
+	if nm == nil {
+		return nil
+	}
+	if !nm.SelfNode.Valid() {
+		return nil
+	}
+
+	ipMaps, err := tailcfg.UnmarshalNodeCapViewJSON[tailcfg.ServiceIPMappings](nm.SelfNode.CapMap(), tailcfg.NodeAttrServiceHost)
+	if len(ipMaps) != 1 || err != nil {
+		return nil
+	}
+
+	return ipMaps[0]
+}
+
+// GetIPVIPServiceMap returns a map of VIP addresses to the service
+// names that has the VIP address. The service names are with the
+// prefix "svc:".
+func (nm *NetworkMap) GetIPVIPServiceMap() IPServiceMappings {
+	var res IPServiceMappings
+	if nm == nil {
+		return res
+	}
+
+	if !nm.SelfNode.Valid() {
+		return res
+	}
+
+	serviceIPMap := nm.GetVIPServiceIPMap()
+	if serviceIPMap == nil {
+		return res
+	}
+	res = make(IPServiceMappings)
+	for svc, addrs := range serviceIPMap {
+		for _, addr := range addrs {
+			res[addr] = svc
+		}
+	}
+	return res
+}
+
+// SelfNodeOrZero returns the self node, or a zero value if nm is nil.
+func (nm *NetworkMap) SelfNodeOrZero() tailcfg.NodeView {
+	if nm == nil {
+		return tailcfg.NodeView{}
+	}
+	return nm.SelfNode
 }
 
 // AnyPeersAdvertiseRoutes reports whether any peer is advertising non-exit node routes.
@@ -241,7 +296,12 @@ func (nm *NetworkMap) PeerWithStableID(pid tailcfg.StableNodeID) (_ tailcfg.Node
 func (nm *NetworkMap) printConciseHeader(buf *strings.Builder) {
 	fmt.Fprintf(buf, "netmap: self: %v auth=%v",
 		nm.NodeKey.ShortString(), nm.GetMachineStatus())
-	login := nm.UserProfiles[nm.User()].LoginName
+
+	var login string
+	up, ok := nm.UserProfiles[nm.User()]
+	if ok {
+		login = up.LoginName()
+	}
 	if login == "" {
 		if nm.User().IsZero() {
 			login = "?"
@@ -377,3 +437,19 @@ const (
 	_ WGConfigFlags = 1 << iota
 	AllowSubnetRoutes
 )
+
+// IPServiceMappings maps IP addresses to service names. This is the inverse of
+// [tailcfg.ServiceIPMappings], and is used to inform track which service a VIP
+// is associated with. This is set to b.ipVIPServiceMap every time the netmap is
+// updated. This is used to reduce the cost for looking up the service name for
+// the dst IP address in the netStack packet processing workflow.
+//
+// This is of the form:
+//
+//	{
+//	  "100.65.32.1": "svc:samba",
+//	  "fd7a:115c:a1e0::1234": "svc:samba",
+//	  "100.102.42.3": "svc:web",
+//	  "fd7a:115c:a1e0::abcd": "svc:web",
+//	}
+type IPServiceMappings map[netip.Addr]tailcfg.ServiceName

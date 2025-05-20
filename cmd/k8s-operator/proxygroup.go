@@ -32,6 +32,7 @@ import (
 	"tailscale.com/ipn"
 	tsoperator "tailscale.com/k8s-operator"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
+	"tailscale.com/kube/egressservices"
 	"tailscale.com/kube/kubetypes"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstime"
@@ -166,6 +167,7 @@ func (r *ProxyGroupReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 			r.recorder.Eventf(pg, corev1.EventTypeWarning, reasonProxyGroupCreationFailed, err.Error())
 			return setStatusReady(pg, metav1.ConditionFalse, reasonProxyGroupCreationFailed, err.Error())
 		}
+		validateProxyClassForPG(logger, pg, proxyClass)
 		if !tsoperator.ProxyClassIsReady(proxyClass) {
 			message := fmt.Sprintf("the ProxyGroup's ProxyClass %s is not yet in a ready state, waiting...", proxyClassName)
 			logger.Info(message)
@@ -202,6 +204,31 @@ func (r *ProxyGroupReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 
 	logger.Info("ProxyGroup resources synced")
 	return setStatusReady(pg, metav1.ConditionTrue, reasonProxyGroupReady, reasonProxyGroupReady)
+}
+
+// validateProxyClassForPG applies custom validation logic for ProxyClass applied to ProxyGroup.
+func validateProxyClassForPG(logger *zap.SugaredLogger, pg *tsapi.ProxyGroup, pc *tsapi.ProxyClass) {
+	if pg.Spec.Type == tsapi.ProxyGroupTypeIngress {
+		return
+	}
+	// Our custom logic for ensuring minimum downtime ProxyGroup update rollouts relies on the local health check
+	// beig accessible on the replica Pod IP:9002. This address can also be modified by users, via
+	// TS_LOCAL_ADDR_PORT env var.
+	//
+	// Currently TS_LOCAL_ADDR_PORT controls Pod's health check and metrics address. _Probably_ there is no need for
+	// users to set this to a custom value. Users who want to consume metrics, should integrate with the metrics
+	// Service and/or ServiceMonitor, rather than Pods directly. The health check is likely not useful to integrate
+	// directly with for operator proxies (and we should aim for unified lifecycle logic in the operator, users
+	// shouldn't need to set their own).
+	//
+	// TODO(irbekrm): maybe disallow configuring this env var in future (in Tailscale 1.84 or later).
+	if hasLocalAddrPortSet(pc) {
+		msg := fmt.Sprintf("ProxyClass %s applied to an egress ProxyGroup has TS_LOCAL_ADDR_PORT env var set to a custom value."+
+			"This will disable the ProxyGroup graceful failover mechanism, so you might experience downtime when ProxyGroup pods are restarted."+
+			"In future we will remove the ability to set custom TS_LOCAL_ADDR_PORT for egress ProxyGroups."+
+			"Please raise an issue if you expect that this will cause issues for your workflow.", pc.Name)
+		logger.Warn(msg)
+	}
 }
 
 func (r *ProxyGroupReconciler) maybeProvision(ctx context.Context, pg *tsapi.ProxyGroup, proxyClass *tsapi.ProxyClass) error {
@@ -253,10 +280,11 @@ func (r *ProxyGroupReconciler) maybeProvision(ctx context.Context, pg *tsapi.Pro
 		return fmt.Errorf("error provisioning RoleBinding: %w", err)
 	}
 	if pg.Spec.Type == tsapi.ProxyGroupTypeEgress {
-		cm := pgEgressCM(pg, r.tsNamespace)
+		cm, hp := pgEgressCM(pg, r.tsNamespace)
 		if _, err := createOrUpdate(ctx, r.Client, r.tsNamespace, cm, func(existing *corev1.ConfigMap) {
 			existing.ObjectMeta.Labels = cm.ObjectMeta.Labels
 			existing.ObjectMeta.OwnerReferences = cm.ObjectMeta.OwnerReferences
+			mak.Set(&existing.BinaryData, egressservices.KeyHEPPings, hp)
 		}); err != nil {
 			return fmt.Errorf("error provisioning egress ConfigMap %q: %w", cm.Name, err)
 		}
@@ -270,11 +298,14 @@ func (r *ProxyGroupReconciler) maybeProvision(ctx context.Context, pg *tsapi.Pro
 			return fmt.Errorf("error provisioning ingress ConfigMap %q: %w", cm.Name, err)
 		}
 	}
-	ss, err := pgStatefulSet(pg, r.tsNamespace, r.proxyImage, r.tsFirewallMode)
+	ss, err := pgStatefulSet(pg, r.tsNamespace, r.proxyImage, r.tsFirewallMode, proxyClass)
 	if err != nil {
 		return fmt.Errorf("error generating StatefulSet spec: %w", err)
 	}
-	ss = applyProxyClassToStatefulSet(proxyClass, ss, nil, logger)
+	cfg := &tailscaleSTSConfig{
+		proxyType: string(pg.Spec.Type),
+	}
+	ss = applyProxyClassToStatefulSet(proxyClass, ss, cfg, logger)
 	capver, err := r.capVerForPG(ctx, pg, logger)
 	if err != nil {
 		return fmt.Errorf("error getting device info: %w", err)
@@ -424,7 +455,7 @@ func (r *ProxyGroupReconciler) ensureConfigSecretsCreated(ctx context.Context, p
 	for i := range pgReplicas(pg) {
 		cfgSecret := &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:            fmt.Sprintf("%s-%d-config", pg.Name, i),
+				Name:            pgConfigSecretName(pg.Name, i),
 				Namespace:       r.tsNamespace,
 				Labels:          pgSecretLabels(pg.Name, "config"),
 				OwnerReferences: pgOwnerReference(pg),
@@ -433,7 +464,7 @@ func (r *ProxyGroupReconciler) ensureConfigSecretsCreated(ctx context.Context, p
 
 		var existingCfgSecret *corev1.Secret // unmodified copy of secret
 		if err := r.Get(ctx, client.ObjectKeyFromObject(cfgSecret), cfgSecret); err == nil {
-			logger.Debugf("secret %s/%s already exists", cfgSecret.GetNamespace(), cfgSecret.GetName())
+			logger.Debugf("Secret %s/%s already exists", cfgSecret.GetNamespace(), cfgSecret.GetName())
 			existingCfgSecret = cfgSecret.DeepCopy()
 		} else if !apierrors.IsNotFound(err) {
 			return "", err
@@ -441,7 +472,7 @@ func (r *ProxyGroupReconciler) ensureConfigSecretsCreated(ctx context.Context, p
 
 		var authKey string
 		if existingCfgSecret == nil {
-			logger.Debugf("creating authkey for new ProxyGroup proxy")
+			logger.Debugf("Creating authkey for new ProxyGroup proxy")
 			tags := pg.Spec.Tags.Stringify()
 			if len(tags) == 0 {
 				tags = r.defaultTags
@@ -462,7 +493,7 @@ func (r *ProxyGroupReconciler) ensureConfigSecretsCreated(ctx context.Context, p
 			if err != nil {
 				return "", fmt.Errorf("error marshalling tailscaled config: %w", err)
 			}
-			mak.Set(&cfgSecret.StringData, tsoperator.TailscaledConfigFileName(cap), string(cfgJSON))
+			mak.Set(&cfgSecret.Data, tsoperator.TailscaledConfigFileName(cap), cfgJSON)
 		}
 
 		// The config sha256 sum is a value for a hash annotation used to trigger
@@ -492,12 +523,14 @@ func (r *ProxyGroupReconciler) ensureConfigSecretsCreated(ctx context.Context, p
 		}
 
 		if existingCfgSecret != nil {
-			logger.Debugf("patching the existing ProxyGroup config Secret %s", cfgSecret.Name)
-			if err := r.Patch(ctx, cfgSecret, client.MergeFrom(existingCfgSecret)); err != nil {
-				return "", err
+			if !apiequality.Semantic.DeepEqual(existingCfgSecret, cfgSecret) {
+				logger.Debugf("Updating the existing ProxyGroup config Secret %s", cfgSecret.Name)
+				if err := r.Update(ctx, cfgSecret); err != nil {
+					return "", err
+				}
 			}
 		} else {
-			logger.Debugf("creating a new config Secret %s for the ProxyGroup", cfgSecret.Name)
+			logger.Debugf("Creating a new config Secret %s for the ProxyGroup", cfgSecret.Name)
 			if err := r.Create(ctx, cfgSecret); err != nil {
 				return "", err
 			}
@@ -568,8 +601,33 @@ func pgTailscaledConfig(pg *tsapi.ProxyGroup, class *tsapi.ProxyClass, idx int32
 		conf.AuthKey = key
 	}
 	capVerConfigs := make(map[tailcfg.CapabilityVersion]ipn.ConfigVAlpha)
+
+	// AdvertiseServices config is set by ingress-pg-reconciler, so make sure we
+	// don't overwrite it here.
+	if err := copyAdvertiseServicesConfig(conf, oldSecret, 106); err != nil {
+		return nil, err
+	}
 	capVerConfigs[106] = *conf
 	return capVerConfigs, nil
+}
+
+func copyAdvertiseServicesConfig(conf *ipn.ConfigVAlpha, oldSecret *corev1.Secret, capVer tailcfg.CapabilityVersion) error {
+	if oldSecret == nil {
+		return nil
+	}
+
+	oldConfB := oldSecret.Data[tsoperator.TailscaledConfigFileName(capVer)]
+	if len(oldConfB) == 0 {
+		return nil
+	}
+
+	var oldConf ipn.ConfigVAlpha
+	if err := json.Unmarshal(oldConfB, &oldConf); err != nil {
+		return fmt.Errorf("error unmarshalling existing config: %w", err)
+	}
+	conf.AdvertiseServices = oldConf.AdvertiseServices
+
+	return nil
 }
 
 func (r *ProxyGroupReconciler) validate(_ *tsapi.ProxyGroup) error {
@@ -592,7 +650,7 @@ func (r *ProxyGroupReconciler) getNodeMetadata(ctx context.Context, pg *tsapi.Pr
 			return nil, fmt.Errorf("unexpected secret %s was labelled as owned by the ProxyGroup %s: %w", secret.Name, pg.Name, err)
 		}
 
-		id, dnsName, ok, err := getNodeMetadata(ctx, &secret)
+		prefs, ok, err := getDevicePrefs(&secret)
 		if err != nil {
 			return nil, err
 		}
@@ -603,8 +661,8 @@ func (r *ProxyGroupReconciler) getNodeMetadata(ctx context.Context, pg *tsapi.Pr
 		nm := nodeMetadata{
 			ordinal:     ordinal,
 			stateSecret: &secret,
-			tsID:        id,
-			dnsName:     dnsName,
+			tsID:        prefs.Config.NodeID,
+			dnsName:     prefs.Config.UserProfile.LoginName,
 		}
 		pod := &corev1.Pod{}
 		if err := r.Get(ctx, client.ObjectKey{Namespace: r.tsNamespace, Name: secret.Name}, pod); err != nil && !apierrors.IsNotFound(err) {
