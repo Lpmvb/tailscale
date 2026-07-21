@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !plan9
@@ -20,18 +20,22 @@ import (
 )
 
 const (
-	operatorDeploymentFilesPath   = "cmd/k8s-operator/deploy"
-	connectorCRDPath              = operatorDeploymentFilesPath + "/crds/tailscale.com_connectors.yaml"
-	proxyClassCRDPath             = operatorDeploymentFilesPath + "/crds/tailscale.com_proxyclasses.yaml"
-	dnsConfigCRDPath              = operatorDeploymentFilesPath + "/crds/tailscale.com_dnsconfigs.yaml"
-	recorderCRDPath               = operatorDeploymentFilesPath + "/crds/tailscale.com_recorders.yaml"
-	proxyGroupCRDPath             = operatorDeploymentFilesPath + "/crds/tailscale.com_proxygroups.yaml"
-	helmTemplatesPath             = operatorDeploymentFilesPath + "/chart/templates"
-	connectorCRDHelmTemplatePath  = helmTemplatesPath + "/connector.yaml"
-	proxyClassCRDHelmTemplatePath = helmTemplatesPath + "/proxyclass.yaml"
-	dnsConfigCRDHelmTemplatePath  = helmTemplatesPath + "/dnsconfig.yaml"
-	recorderCRDHelmTemplatePath   = helmTemplatesPath + "/recorder.yaml"
-	proxyGroupCRDHelmTemplatePath = helmTemplatesPath + "/proxygroup.yaml"
+	operatorDeploymentFilesPath         = "cmd/k8s-operator/deploy"
+	connectorCRDPath                    = operatorDeploymentFilesPath + "/crds/tailscale.com_connectors.yaml"
+	proxyClassCRDPath                   = operatorDeploymentFilesPath + "/crds/tailscale.com_proxyclasses.yaml"
+	dnsConfigCRDPath                    = operatorDeploymentFilesPath + "/crds/tailscale.com_dnsconfigs.yaml"
+	recorderCRDPath                     = operatorDeploymentFilesPath + "/crds/tailscale.com_recorders.yaml"
+	proxyGroupCRDPath                   = operatorDeploymentFilesPath + "/crds/tailscale.com_proxygroups.yaml"
+	tailnetCRDPath                      = operatorDeploymentFilesPath + "/crds/tailscale.com_tailnets.yaml"
+	proxyGroupPolicyCRDPath             = operatorDeploymentFilesPath + "/crds/tailscale.com_proxygrouppolicies.yaml"
+	helmTemplatesPath                   = operatorDeploymentFilesPath + "/chart/templates"
+	connectorCRDHelmTemplatePath        = helmTemplatesPath + "/connector.yaml"
+	proxyClassCRDHelmTemplatePath       = helmTemplatesPath + "/proxyclass.yaml"
+	dnsConfigCRDHelmTemplatePath        = helmTemplatesPath + "/dnsconfig.yaml"
+	recorderCRDHelmTemplatePath         = helmTemplatesPath + "/recorder.yaml"
+	proxyGroupCRDHelmTemplatePath       = helmTemplatesPath + "/proxygroup.yaml"
+	tailnetCRDHelmTemplatePath          = helmTemplatesPath + "/tailnet.yaml"
+	proxyGroupPolicyCRDHelmTemplatePath = helmTemplatesPath + "/proxygrouppolicy.yaml"
 
 	helmConditionalStart = "{{ if .Values.installCRDs -}}\n"
 	helmConditionalEnd   = "{{- end -}}"
@@ -41,11 +45,16 @@ func main() {
 	if len(os.Args) < 2 {
 		log.Fatalf("usage ./generate [staticmanifests|helmcrd]")
 	}
-	repoRoot := "../../"
+	gitOut, err := exec.Command("git", "rev-parse", "--show-toplevel").CombinedOutput()
+	if err != nil {
+		log.Fatalf("error determining git root: %v: %s", err, gitOut)
+	}
+
+	repoRoot := strings.TrimSpace(string(gitOut))
 	switch os.Args[1] {
 	case "helmcrd": // insert CRDs to Helm templates behind a installCRDs=true conditional check
 		log.Print("Adding CRDs to Helm templates")
-		if err := generate("./"); err != nil {
+		if err := generate(repoRoot); err != nil {
 			log.Fatalf("error adding CRDs to Helm templates: %v", err)
 		}
 		return
@@ -64,7 +73,7 @@ func main() {
 	}()
 	log.Print("Templating Helm chart contents")
 	helmTmplCmd := exec.Command("./tool/helm", "template", "operator", "./cmd/k8s-operator/deploy/chart",
-		"--namespace=tailscale")
+		"--namespace=tailscale", "--set=oauth.clientSecret=''")
 	helmTmplCmd.Dir = repoRoot
 	var out bytes.Buffer
 	helmTmplCmd.Stdout = &out
@@ -139,7 +148,7 @@ func generate(baseDir string) error {
 		if _, err := file.Write([]byte(helmConditionalEnd)); err != nil {
 			return fmt.Errorf("error writing helm if-statement end: %w", err)
 		}
-		return nil
+		return file.Close()
 	}
 	for _, crd := range []struct {
 		crdPath, templatePath string
@@ -149,6 +158,8 @@ func generate(baseDir string) error {
 		{dnsConfigCRDPath, dnsConfigCRDHelmTemplatePath},
 		{recorderCRDPath, recorderCRDHelmTemplatePath},
 		{proxyGroupCRDPath, proxyGroupCRDHelmTemplatePath},
+		{tailnetCRDPath, tailnetCRDHelmTemplatePath},
+		{proxyGroupPolicyCRDPath, proxyGroupPolicyCRDHelmTemplatePath},
 	} {
 		if err := addCRDToHelm(crd.crdPath, crd.templatePath); err != nil {
 			return fmt.Errorf("error adding %s CRD to Helm templates: %w", crd.crdPath, err)
@@ -165,6 +176,8 @@ func cleanup(baseDir string) error {
 		dnsConfigCRDHelmTemplatePath,
 		recorderCRDHelmTemplatePath,
 		proxyGroupCRDHelmTemplatePath,
+		tailnetCRDHelmTemplatePath,
+		proxyGroupPolicyCRDHelmTemplatePath,
 	} {
 		if err := os.Remove(filepath.Join(baseDir, path)); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("error cleaning up %s: %w", path, err)

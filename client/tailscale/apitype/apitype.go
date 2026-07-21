@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package apitype contains types for the Tailscale LocalAPI and control plane API.
@@ -76,7 +76,7 @@ type ReloadConfigResponse struct {
 type ExitNodeSuggestionResponse struct {
 	ID       tailcfg.StableNodeID
 	Name     string
-	Location tailcfg.LocationView `json:",omitempty"`
+	Location tailcfg.LocationView `json:",omitzero"`
 }
 
 // DNSOSConfig mimics dns.OSConfig without forcing us to import the entire dns package
@@ -93,4 +93,14 @@ type DNSQueryResponse struct {
 	Bytes []byte
 	// Resolvers is the list of resolvers that the forwarder deemed able to resolve the query.
 	Resolvers []*dnstype.Resolver
+}
+
+// OptionalFeatures describes which optional features are enabled in the build.
+type OptionalFeatures struct {
+	// Features is the map of optional feature names to whether they are
+	// enabled.
+	//
+	// Disabled features may be absent from the map. (That is, false values
+	// are not guaranteed to be present.)
+	Features map[string]bool
 }

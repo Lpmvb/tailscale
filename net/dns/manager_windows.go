@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package dns
@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io/fs"
 	"maps"
 	"net/netip"
 	"os"
@@ -16,7 +17,6 @@ import (
 	"slices"
 	"sort"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -27,12 +27,15 @@ import (
 	"tailscale.com/control/controlknobs"
 	"tailscale.com/envknob"
 	"tailscale.com/health"
+	"tailscale.com/syncs"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/dnsname"
-	"tailscale.com/util/syspolicy"
-	"tailscale.com/util/syspolicy/rsop"
-	"tailscale.com/util/syspolicy/setting"
+	"tailscale.com/util/eventbus"
+	"tailscale.com/util/syspolicy/pkey"
+	"tailscale.com/util/syspolicy/policyclient"
+	"tailscale.com/util/syspolicy/ptype"
 	"tailscale.com/util/winutil"
+	"tailscale.com/util/winutil/winenv"
 )
 
 const (
@@ -47,21 +50,26 @@ type windowsManager struct {
 	knobs      *controlknobs.Knobs // or nil
 	nrptDB     *nrptRuleDatabase
 	wslManager *wslManager
+	polc       policyclient.Client
 
 	unregisterPolicyChangeCb func() // called when the manager is closing
 
-	mu      sync.Mutex
+	mu      syncs.Mutex
 	closing bool
 }
 
 // NewOSConfigurator created a new OS configurator.
 //
-// The health tracker and the knobs may be nil.
-func NewOSConfigurator(logf logger.Logf, health *health.Tracker, knobs *controlknobs.Knobs, interfaceName string) (OSConfigurator, error) {
+// The health tracker, eventbus and the knobs may be nil.
+func NewOSConfigurator(logf logger.Logf, health *health.Tracker, bus *eventbus.Bus, polc policyclient.Client, knobs *controlknobs.Knobs, interfaceName string) (OSConfigurator, error) {
+	if polc == nil {
+		panic("nil policyclient.Client")
+	}
 	ret := &windowsManager{
 		logf:       logf,
 		guid:       interfaceName,
 		knobs:      knobs,
+		polc:       polc,
 		wslManager: newWSLManager(logf, health),
 	}
 
@@ -70,7 +78,7 @@ func NewOSConfigurator(logf logger.Logf, health *health.Tracker, knobs *controlk
 	}
 
 	var err error
-	if ret.unregisterPolicyChangeCb, err = syspolicy.RegisterChangeCallback(ret.sysPolicyChanged); err != nil {
+	if ret.unregisterPolicyChangeCb, err = polc.RegisterChangeCallback("", ret.sysPolicyChanged); err != nil {
 		logf("error registering policy change callback: %v", err) // non-fatal
 	}
 
@@ -139,7 +147,7 @@ func (m *windowsManager) setSplitDNS(resolvers []netip.Addr, domains []dnsname.F
 		return fmt.Errorf("Split DNS unsupported on this Windows version")
 	}
 
-	defer m.nrptDB.Refresh()
+	defer m.nrptDB.NotifyPolicyChanged()
 	if len(resolvers) == 0 {
 		return m.nrptDB.DelAllRuleKeys()
 	}
@@ -158,7 +166,7 @@ func setTailscaleHosts(logf logger.Logf, prevHostsFile []byte, hosts []*HostEntr
 		header = "# TailscaleHostsSectionStart"
 		footer = "# TailscaleHostsSectionEnd"
 	)
-	var comments = []string{
+	comments := []string{
 		"# This section contains MagicDNS entries for Tailscale.",
 		"# Do not edit this section manually.",
 	}
@@ -239,7 +247,13 @@ func (m *windowsManager) setHosts(hosts []*HostEntry) error {
 	}
 	hostsFile := filepath.Join(systemDir, "drivers", "etc", "hosts")
 	b, err := os.ReadFile(hostsFile)
-	if err != nil {
+	switch {
+	case err == nil:
+		// Continue.
+	case errors.Is(err, fs.ErrNotExist):
+		// Non-fatal, we'll just create a new hosts file.
+		m.logf("failed to read the hosts file: %v", err)
+	default:
 		return err
 	}
 	outB, err := setTailscaleHosts(m.logf, b, hosts)
@@ -348,6 +362,10 @@ func (m *windowsManager) disableLocalDNSOverrideViaNRPT() bool {
 	return m.knobs != nil && m.knobs.DisableLocalDNSOverrideViaNRPT.Load()
 }
 
+func (m *windowsManager) disableHostsFileUpdates() bool {
+	return m.knobs != nil && m.knobs.DisableHostsFileUpdates.Load()
+}
+
 func (m *windowsManager) SetDNS(cfg OSConfig) error {
 	// We can configure Windows DNS in one of two ways:
 	//
@@ -393,7 +411,15 @@ func (m *windowsManager) SetDNS(cfg OSConfig) error {
 		if err := m.setSplitDNS(resolvers, domains); err != nil {
 			return err
 		}
-		if err := m.setHosts(nil); err != nil {
+		var hosts []*HostEntry
+		if !m.disableHostsFileUpdates() && winenv.IsDomainJoined() {
+			// On domain-joined Windows devices the primary search domain (the one the device is joined to)
+			// always takes precedence over other search domains. This breaks MagicDNS when we are the primary
+			// resolver on the device (see #18712). To work around this Windows behavior, we should write MagicDNS
+			// host names the hosts file just as we do when we're not the primary resolver.
+			hosts = cfg.Hosts
+		}
+		if err := m.setHosts(hosts); err != nil {
 			return err
 		}
 		if err := m.setPrimaryDNS(cfg.Nameservers, cfg.SearchDomains); err != nil {
@@ -415,12 +441,14 @@ func (m *windowsManager) SetDNS(cfg OSConfig) error {
 			return err
 		}
 
-		// As we are not the primary resolver in this setup, we need to
-		// explicitly set some single name hosts to ensure that we can resolve
-		// them quickly and get around the 2.3s delay that otherwise occurs due
-		// to multicast timeouts.
-		if err := m.setHosts(cfg.Hosts); err != nil {
-			return err
+		if !m.disableHostsFileUpdates() {
+			// As we are not the primary resolver in this setup, we need to
+			// explicitly set some single name hosts to ensure that we can resolve
+			// them quickly and get around the 2.3s delay that otherwise occurs due
+			// to multicast timeouts.
+			if err := m.setHosts(cfg.Hosts); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -507,8 +535,8 @@ func (m *windowsManager) Close() error {
 
 // sysPolicyChanged is a callback triggered by [syspolicy] when it detects
 // a change in one or more syspolicy settings.
-func (m *windowsManager) sysPolicyChanged(policy *rsop.PolicyChange) {
-	if policy.HasChanged(syspolicy.EnableDNSRegistration) {
+func (m *windowsManager) sysPolicyChanged(policy policyclient.PolicyChange) {
+	if policy.HasChanged(pkey.EnableDNSRegistration) {
 		m.reconfigureDNSRegistration()
 	}
 }
@@ -520,7 +548,7 @@ func (m *windowsManager) reconfigureDNSRegistration() {
 	// Disable DNS registration by default (if the policy setting is not configured).
 	// This is primarily for historical reasons and to avoid breaking existing
 	// setups that rely on this behavior.
-	enableDNSRegistration, err := syspolicy.GetPreferenceOptionOrDefault(syspolicy.EnableDNSRegistration, setting.NeverByPolicy)
+	enableDNSRegistration, err := m.polc.GetPreferenceOption(pkey.EnableDNSRegistration, ptype.NeverByPolicy)
 	if err != nil {
 		m.logf("error getting DNSRegistration policy setting: %v", err) // non-fatal; we'll use the default
 	}

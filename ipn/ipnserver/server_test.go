@@ -1,10 +1,11 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package ipnserver_test
 
 import (
 	"context"
+	"errors"
 	"runtime"
 	"strconv"
 	"sync"
@@ -14,7 +15,9 @@ import (
 	"tailscale.com/envknob"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/lapitest"
-	"tailscale.com/types/ptr"
+	"tailscale.com/tsd"
+	"tailscale.com/util/syspolicy/pkey"
+	"tailscale.com/util/syspolicy/policytest"
 )
 
 func TestUserConnectDisconnectNonWindows(t *testing.T) {
@@ -45,7 +48,7 @@ func TestUserConnectDisconnectNonWindows(t *testing.T) {
 
 	// And if we send a notification, both users should receive it.
 	wantErrMessage := "test error"
-	testNotify := ipn.Notify{ErrMessage: ptr.To(wantErrMessage)}
+	testNotify := ipn.Notify{ErrMessage: new(wantErrMessage)}
 	server.Backend().DebugNotify(testNotify)
 
 	if n, err := watcherA.Next(); err != nil {
@@ -152,7 +155,7 @@ func TestConcurrentOSUserSwitchingOnWindows(t *testing.T) {
 
 		// Get the current user from the LocalBackend's perspective
 		// as soon as we're connected.
-		gotUID, gotActor := server.Backend().CurrentUserForTest()
+		gotUID, gotActor := server.Backend().ForTest().CurrentUser()
 
 		// Wait for the first notification to arrive.
 		// It will either be the initial state we've requested via [ipn.NotifyInitialState],
@@ -250,6 +253,62 @@ func TestBlockWhileIdentityInUse(t *testing.T) {
 		userB := server.MakeTestActor("UserB", "ClientB")
 		server.BlockWhileInUseByOther(ctx, userB)
 		<-userADone
+	}
+}
+
+func TestShutdownViaLocalAPI(t *testing.T) {
+	t.Parallel()
+
+	errAccessDeniedByPolicy := errors.New("Access denied: shutdown access denied by policy")
+
+	tests := []struct {
+		name                   string
+		allowTailscaledRestart *bool
+		wantErr                error
+	}{
+		{
+			name:                   "AllowTailscaledRestart/NotConfigured",
+			allowTailscaledRestart: nil,
+			wantErr:                errAccessDeniedByPolicy,
+		},
+		{
+			name:                   "AllowTailscaledRestart/False",
+			allowTailscaledRestart: new(false),
+			wantErr:                errAccessDeniedByPolicy,
+		},
+		{
+			name:                   "AllowTailscaledRestart/True",
+			allowTailscaledRestart: new(true),
+			wantErr:                nil, // shutdown should be allowed
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			sys := tsd.NewSystem()
+
+			var pol policytest.Config
+			if tt.allowTailscaledRestart != nil {
+				pol.Set(pkey.AllowTailscaledRestart, *tt.allowTailscaledRestart)
+			}
+			sys.Set(pol)
+
+			server := lapitest.NewServer(t, lapitest.WithSys(sys))
+			lc := server.ClientWithName("User")
+
+			err := lc.ShutdownTailscaled(t.Context())
+			checkError(t, err, tt.wantErr)
+		})
+	}
+}
+
+func checkError(tb testing.TB, got, want error) {
+	tb.Helper()
+	if (want == nil) != (got == nil) ||
+		(want != nil && got != nil && want.Error() != got.Error() && !errors.Is(got, want)) {
+		tb.Fatalf("gotErr: %v; wantErr: %v", got, want)
 	}
 }
 

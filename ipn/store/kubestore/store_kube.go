@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package kubestore contains an ipn.StateStore implementation using Kubernetes Secrets.
@@ -6,15 +6,17 @@ package kubestore
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"log"
 	"net"
+	"net/http"
 	"os"
 	"strings"
 	"time"
 
 	"tailscale.com/envknob"
 	"tailscale.com/ipn"
+	"tailscale.com/ipn/store"
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/kube/kubeapi"
 	"tailscale.com/kube/kubeclient"
@@ -23,6 +25,13 @@ import (
 	"tailscale.com/util/dnsname"
 	"tailscale.com/util/mak"
 )
+
+func init() {
+	store.Register("kube:", func(logf logger.Logf, path string) (ipn.StateStore, error) {
+		secretName := strings.TrimPrefix(path, "kube:")
+		return New(logf, secretName)
+	})
+}
 
 const (
 	// timeout is the timeout for a single state update that includes calls to the API server to write or read a
@@ -47,6 +56,8 @@ type Store struct {
 	secretName    string // state Secret
 	certShareMode string // 'ro', 'rw', or empty
 	podName       string
+
+	logf logger.Logf
 
 	// memory holds the latest tailscale state. Writes write state to a kube
 	// Secret and memory, Reads read from memory.
@@ -87,6 +98,7 @@ func newWithClient(logf logger.Logf, c kubeclient.Client, secretName string) (*S
 		canPatch:   canPatch,
 		secretName: secretName,
 		podName:    os.Getenv("POD_NAME"),
+		logf:       logf,
 	}
 	if envknob.IsCertShareReadWriteMode() {
 		s.certShareMode = "rw"
@@ -98,17 +110,21 @@ func newWithClient(logf logger.Logf, c kubeclient.Client, secretName string) (*S
 	if err := s.loadState(); err != nil && err != ipn.ErrStateNotExist {
 		return nil, fmt.Errorf("error loading state from kube Secret: %w", err)
 	}
-	// If we are in cert share mode, pre-load existing shared certs.
-	if s.certShareMode == "rw" || s.certShareMode == "ro" {
+	// If we are in read-only cert share mode, pre-load existing shared certs.
+	// Write replicas never load certs in-memory to avoid a situation where,
+	// after Ingress recreation (and the associated cert Secret recreation), new
+	// TLS certs don't get issued because the write replica still has certs
+	// in-memory. Instead, write replicas fetch certs from Secret on each request.
+	if s.certShareMode == "ro" {
 		sel := s.certSecretSelector()
 		if err := s.loadCerts(context.Background(), sel); err != nil {
 			// We will attempt to again retrieve the certs from Secrets when a request for an HTTPS endpoint
 			// is received.
-			log.Printf("[unexpected] error loading TLS certs: %v", err)
+			s.logf("[unexpected] error loading TLS certs: %v", err)
 		}
 	}
 	if s.certShareMode == "ro" {
-		go s.runCertReload(context.Background(), logf)
+		go s.runCertReload(context.Background())
 	}
 	return s, nil
 }
@@ -131,6 +147,9 @@ func (s *Store) WriteState(id ipn.StateKey, bs []byte) (err error) {
 			s.memory.WriteState(ipn.StateKey(sanitizeKey(id)), bs)
 		}
 	}()
+	if bs == nil {
+		return s.removeSecretField(string(id), s.secretName)
+	}
 	return s.updateSecret(map[string][]byte{string(id): bs}, s.secretName)
 }
 
@@ -138,7 +157,7 @@ func (s *Store) WriteState(id ipn.StateKey, bs []byte) (err error) {
 // of a Tailscale Kubernetes node's state Secret.
 func (s *Store) WriteTLSCertAndKey(domain string, cert, key []byte) (err error) {
 	if s.certShareMode == "ro" {
-		log.Printf("[unexpected] TLS cert and key write in read-only mode")
+		s.logf("[unexpected] TLS cert and key write in read-only mode")
 	}
 	if err := dnsname.ValidHostname(domain); err != nil {
 		return fmt.Errorf("invalid domain name %q: %w", domain, err)
@@ -164,7 +183,7 @@ func (s *Store) WriteTLSCertAndKey(domain string, cert, key []byte) (err error) 
 	// written to memory to avoid out of sync memory state after
 	// Ingress resources have been recreated.  This means that TLS
 	// certs for write replicas are retrieved from the Secret on
-	// each HTTPS request.  This is a temporary solution till we
+	// each HTTPS request. This is a temporary solution till we
 	// implement a Secret watch.
 	if s.certShareMode != "rw" {
 		s.memory.WriteState(ipn.StateKey(domain+".crt"), cert)
@@ -203,6 +222,23 @@ func (s *Store) ReadTLSCertAndKey(domain string) (cert, key []byte, err error) {
 			// that wraps ipn.ErrStateNotExist here.
 			return nil, nil, ipn.ErrStateNotExist
 		}
+		st, ok := err.(*kubeapi.Status)
+		if ok && st.Code == http.StatusForbidden && (s.certShareMode == "ro" || s.certShareMode == "rw") {
+			// In cert share mode, we read from a dedicated Secret per domain.
+			// To get here, we already had a cache miss from our in-memory
+			// store. For write replicas, that means it wasn't available on
+			// start and it wasn't written since. For read replicas, that means
+			// it wasn't available on start and it hasn't been reloaded in the
+			// background. So getting a "forbidden" error is an expected
+			// "not found" case where we've been asked for a cert we don't
+			// expect to issue, and so the forbidden error reflects that the
+			// operator didn't assign permission for a Secret for that domain.
+			//
+			// This code path gets triggered by the admin UI's machine page,
+			// which queries for the node's own TLS cert existing via the
+			// "tls-cert-status" c2n API.
+			return nil, nil, ipn.ErrStateNotExist
+		}
 		return nil, nil, fmt.Errorf("getting TLS Secret %q: %w", domain, err)
 	}
 	cert = secret.Data[keyTLSCert]
@@ -232,11 +268,11 @@ func (s *Store) updateSecret(data map[string][]byte, secretName string) (err err
 	defer func() {
 		if err != nil {
 			if err := s.client.Event(ctx, eventTypeWarning, reasonTailscaleStateUpdateFailed, err.Error()); err != nil {
-				log.Printf("kubestore: error creating tailscaled state update Event: %v", err)
+				s.logf("kubestore: error creating tailscaled state update Event: %v", err)
 			}
 		} else {
 			if err := s.client.Event(ctx, eventTypeNormal, reasonTailscaleStateUpdated, "Successfully updated tailscaled state Secret"); err != nil {
-				log.Printf("kubestore: error creating tailscaled state Event: %v", err)
+				s.logf("kubestore: error creating tailscaled state Event: %v", err)
 			}
 		}
 		cancel()
@@ -306,6 +342,29 @@ func (s *Store) updateSecret(data map[string][]byte, secretName string) (err err
 	return nil
 }
 
+func (s *Store) removeSecretField(key, secretName string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if s.canPatchSecret(secretName) {
+		return s.client.JSONPatchResource(ctx, secretName, kubeclient.TypeSecrets, []kubeclient.JSONPatch{
+			{
+				Op:   "remove",
+				Path: "/data/" + sanitizeKey(ipn.StateKey(key)),
+			},
+		})
+	}
+	// No patch permissions, use UPDATE: get the secret, delete the key, update.
+	secret, err := s.client.GetSecret(ctx, secretName)
+	if err != nil {
+		return fmt.Errorf("error getting Secret %s: %w", secretName, err)
+	}
+	delete(secret.Data, sanitizeKey(ipn.StateKey(key)))
+	if err := s.client.UpdateSecret(ctx, secret); err != nil {
+		return fmt.Errorf("error updating Secret %s: %w", secretName, err)
+	}
+	return nil
+}
+
 func (s *Store) loadState() (err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -316,15 +375,70 @@ func (s *Store) loadState() (err error) {
 			return ipn.ErrStateNotExist
 		}
 		if err := s.client.Event(ctx, eventTypeWarning, reasonTailscaleStateLoadFailed, err.Error()); err != nil {
-			log.Printf("kubestore: error creating Event: %v", err)
+			s.logf("kubestore: error creating Event: %v", err)
 		}
 		return err
 	}
 	if err := s.client.Event(ctx, eventTypeNormal, reasonTailscaleStateLoaded, "Successfully loaded tailscaled state from Secret"); err != nil {
-		log.Printf("kubestore: error creating Event: %v", err)
+		s.logf("kubestore: error creating Event: %v", err)
 	}
-	s.memory.LoadFromMap(secret.Data)
+	data, err := s.maybeStripAttestationKeyFromProfile(secret.Data)
+	if err != nil {
+		return fmt.Errorf("error attempting to strip attestation data from state Secret: %w", err)
+	}
+	s.memory.LoadFromMap(data)
 	return nil
+}
+
+// maybeStripAttestationKeyFromProfile removes the hardware attestation key
+// field from serialized Tailscale profile. This is done to recover from a bug
+// introduced in 1.92, where node-bound hardware attestation keys were added to
+// Tailscale states stored in Kubernetes Secrets.
+// See https://github.com/tailscale/tailscale/issues/18302
+// TODO(irbekrm): it would be good if we could somehow determine when we no
+// longer need to run this check.
+func (s *Store) maybeStripAttestationKeyFromProfile(data map[string][]byte) (map[string][]byte, error) {
+	prefsKey := extractPrefsKey(data)
+	prefsBytes, ok := data[prefsKey]
+	if !ok {
+		return data, nil
+	}
+	var prefs map[string]any
+	if err := json.Unmarshal(prefsBytes, &prefs); err != nil {
+		s.logf("[unexpected]: kube store: failed to unmarshal prefs data")
+		// don't error as in most cases the state won't have the attestation key
+		return data, nil
+	}
+
+	config, ok := prefs["Config"].(map[string]any)
+	if !ok {
+		return data, nil
+	}
+	if _, hasKey := config["AttestationKey"]; !hasKey {
+		return data, nil
+	}
+	s.logf("kube store: found redundant attestation key, deleting")
+	delete(config, "AttestationKey")
+	prefsBytes, err := json.Marshal(prefs)
+	if err != nil {
+		return nil, fmt.Errorf("[unexpected] kube store: failed to marshal profile after removing attestation key: %v", err)
+	}
+	data[prefsKey] = prefsBytes
+	if err := s.updateSecret(map[string][]byte{prefsKey: prefsBytes}, s.secretName); err != nil {
+		// don't error out - this might have been a temporary kube API server
+		// connection issue. The key will be removed from the in-memory cache
+		// and we'll retry updating the Secret on the next restart.
+		s.logf("kube store: error updating Secret after stripping AttestationKey: %v", err)
+	}
+	return data, nil
+}
+
+const currentProfileKey = "_current-profile"
+
+// extractPrefs returns the key at which Tailscale prefs are stored in the
+// provided Secret data.
+func extractPrefsKey(data map[string][]byte) string {
+	return string(data[currentProfileKey])
 }
 
 // runCertReload relists and reloads all TLS certs for endpoints shared by this
@@ -335,7 +449,7 @@ func (s *Store) loadState() (err error) {
 // Note that if shared certs are not found in memory on an HTTPS request, we
 // do a Secret lookup, so this mechanism does not need to ensure that newly
 // added Ingresses' certs get loaded.
-func (s *Store) runCertReload(ctx context.Context, logf logger.Logf) {
+func (s *Store) runCertReload(ctx context.Context) {
 	ticker := time.NewTicker(time.Hour * 24)
 	defer ticker.Stop()
 	for {
@@ -345,7 +459,7 @@ func (s *Store) runCertReload(ctx context.Context, logf logger.Logf) {
 		case <-ticker.C:
 			sel := s.certSecretSelector()
 			if err := s.loadCerts(ctx, sel); err != nil {
-				logf("[unexpected] error reloading TLS certs: %v", err)
+				s.logf("[unexpected] error reloading TLS certs: %v", err)
 			}
 		}
 	}
@@ -394,8 +508,8 @@ func (s *Store) canPatchSecret(secret string) bool {
 // certSecretSelector returns a label selector that can be used to list all
 // Secrets that aren't Tailscale state Secrets and contain TLS certificates for
 // HTTPS endpoints that this node serves.
-// Currently (3/2025) this only applies to the Kubernetes Operator's ingress
-// ProxyGroup.
+// Currently (7/2025) this only applies to the Kubernetes Operator's ProxyGroup
+// when spec.Type is "ingress" or "kube-apiserver".
 func (s *Store) certSecretSelector() map[string]string {
 	if s.podName == "" {
 		return map[string]string{}
@@ -406,7 +520,7 @@ func (s *Store) certSecretSelector() map[string]string {
 	}
 	pgName := s.podName[:p]
 	return map[string]string{
-		kubetypes.LabelSecretType:   "certs",
+		kubetypes.LabelSecretType:   kubetypes.LabelSecretTypeCerts,
 		kubetypes.LabelManaged:      "true",
 		"tailscale.com/proxy-group": pgName,
 	}

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package main
@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"tailscale.com/derp/derphttp"
+	"tailscale.com/derp/derpserver"
 	"tailscale.com/tstest/deptest"
 )
 
@@ -46,30 +46,30 @@ func TestNoContent(t *testing.T) {
 		want  string
 	}{
 		{
-			name: "no challenge",
+			name: "no-challenge",
 		},
 		{
-			name:  "valid challenge",
+			name:  "valid-challenge",
 			input: "input",
 			want:  "response input",
 		},
 		{
-			name:  "valid challenge hostname",
+			name:  "valid-challenge-hostname",
 			input: "ts_derp99b.tailscale.com",
 			want:  "response ts_derp99b.tailscale.com",
 		},
 		{
-			name:  "invalid challenge",
+			name:  "invalid-challenge",
 			input: "foo\x00bar",
 			want:  "",
 		},
 		{
-			name:  "whitespace invalid challenge",
+			name:  "whitespace-invalid-challenge",
 			input: "foo bar",
 			want:  "",
 		},
 		{
-			name:  "long challenge",
+			name:  "long-challenge",
 			input: strings.Repeat("x", 65),
 			want:  "",
 		},
@@ -78,20 +78,20 @@ func TestNoContent(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			req, _ := http.NewRequest("GET", "https://localhost/generate_204", nil)
 			if tt.input != "" {
-				req.Header.Set(derphttp.NoContentChallengeHeader, tt.input)
+				req.Header.Set(derpserver.NoContentChallengeHeader, tt.input)
 			}
 			w := httptest.NewRecorder()
-			derphttp.ServeNoContent(w, req)
+			derpserver.ServeNoContent(w, req)
 			resp := w.Result()
 
 			if tt.want == "" {
-				if h, found := resp.Header[derphttp.NoContentResponseHeader]; found {
+				if h, found := resp.Header[derpserver.NoContentResponseHeader]; found {
 					t.Errorf("got %+v; expected no response header", h)
 				}
 				return
 			}
 
-			if got := resp.Header.Get(derphttp.NoContentResponseHeader); got != tt.want {
+			if got := resp.Header.Get(derpserver.NoContentResponseHeader); got != tt.want {
 				t.Errorf("got %q; want %q", got, tt.want)
 			}
 		})
@@ -137,47 +137,4 @@ func TestTemplate(t *testing.T) {
 	if !strings.Contains(str, "Debug info") {
 		t.Error("Output is missing debug info")
 	}
-}
-
-func TestCheckMeshKey(t *testing.T) {
-	testCases := []struct {
-		name    string
-		input   string
-		want    string
-		wantErr bool
-	}{
-		{
-			name:    "KeyOkay",
-			input:   "f1ffafffffffffffffffffffffffffffffffffffffffffffffffff2ffffcfff6",
-			want:    "f1ffafffffffffffffffffffffffffffffffffffffffffffffffff2ffffcfff6",
-			wantErr: false,
-		},
-		{
-			name:    "TrimKeyOkay",
-			input:   "  f1ffafffffffffffffffffffffffffffffffffffffffffffffffff2ffffcfff6  ",
-			want:    "f1ffafffffffffffffffffffffffffffffffffffffffffffffffff2ffffcfff6",
-			wantErr: false,
-		},
-		{
-			name:    "NotAKey",
-			input:   "zzthisisnotakey",
-			want:    "",
-			wantErr: true,
-		},
-	}
-	for _, tt := range testCases {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			k, err := checkMeshKey(tt.input)
-			if err != nil && !tt.wantErr {
-				t.Errorf("unexpected error: %v", err)
-			}
-			if k != tt.want && err == nil {
-				t.Errorf("want: %s doesn't match expected: %s", tt.want, k)
-			}
-
-		})
-	}
-
 }

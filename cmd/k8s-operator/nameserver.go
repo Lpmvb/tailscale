@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !plan9
@@ -7,14 +7,13 @@ package main
 
 import (
 	"context"
+	_ "embed"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
 	"sync"
 
-	_ "embed"
-
-	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	xslices "golang.org/x/exp/slices"
 	appsv1 "k8s.io/api/apps/v1"
@@ -27,6 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/yaml"
+
 	tsoperator "tailscale.com/k8s-operator"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
 	"tailscale.com/kube/kubetypes"
@@ -45,10 +45,7 @@ const (
 	messageMultipleDNSConfigsPresent = "Multiple DNSConfig resources found in cluster. Please ensure no more than one is present."
 
 	defaultNameserverImageRepo = "tailscale/k8s-nameserver"
-	// TODO (irbekrm): once we start publishing nameserver images for stable
-	// track, replace 'unstable' here with the version of this operator
-	// instance.
-	defaultNameserverImageTag = "unstable"
+	defaultNameserverImageTag  = "stable"
 )
 
 // NameserverReconciler knows how to create nameserver resources in cluster in
@@ -106,7 +103,7 @@ func (a *NameserverReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 		if !apiequality.Semantic.DeepEqual(oldCnStatus, &dnsCfg.Status) {
 			// An error encountered here should get returned by the Reconcile function.
 			if updateErr := a.Client.Status().Update(ctx, dnsCfg); updateErr != nil {
-				err = errors.Wrap(err, updateErr.Error())
+				err = errors.Join(err, updateErr)
 			}
 		}
 		return res, err
@@ -131,7 +128,7 @@ func (a *NameserverReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 			return setStatus(&dnsCfg, metav1.ConditionFalse, reasonNameserverCreationFailed, msg)
 		}
 	}
-	if err := a.maybeProvision(ctx, &dnsCfg, logger); err != nil {
+	if err = a.maybeProvision(ctx, &dnsCfg); err != nil {
 		if strings.Contains(err.Error(), optimisticLockErrorMsg) {
 			logger.Infof("optimistic lock error, retrying: %s", err)
 			return reconcile.Result{}, nil
@@ -168,7 +165,7 @@ func nameserverResourceLabels(name, namespace string) map[string]string {
 	return labels
 }
 
-func (a *NameserverReconciler) maybeProvision(ctx context.Context, tsDNSCfg *tsapi.DNSConfig, logger *zap.SugaredLogger) error {
+func (a *NameserverReconciler) maybeProvision(ctx context.Context, tsDNSCfg *tsapi.DNSConfig) error {
 	labels := nameserverResourceLabels(tsDNSCfg.Name, a.tsNamespace)
 	dCfg := &deployConfig{
 		ownerRefs: []metav1.OwnerReference{*metav1.NewControllerRef(tsDNSCfg, tsapi.SchemeGroupVersion.WithKind("DNSConfig"))},
@@ -176,6 +173,11 @@ func (a *NameserverReconciler) maybeProvision(ctx context.Context, tsDNSCfg *tsa
 		labels:    labels,
 		imageRepo: defaultNameserverImageRepo,
 		imageTag:  defaultNameserverImageTag,
+		replicas:  1,
+	}
+
+	if tsDNSCfg.Spec.Nameserver.Replicas != nil {
+		dCfg.replicas = *tsDNSCfg.Spec.Nameserver.Replicas
 	}
 	if tsDNSCfg.Spec.Nameserver.Image != nil && tsDNSCfg.Spec.Nameserver.Image.Repo != "" {
 		dCfg.imageRepo = tsDNSCfg.Spec.Nameserver.Image.Repo
@@ -183,6 +185,15 @@ func (a *NameserverReconciler) maybeProvision(ctx context.Context, tsDNSCfg *tsa
 	if tsDNSCfg.Spec.Nameserver.Image != nil && tsDNSCfg.Spec.Nameserver.Image.Tag != "" {
 		dCfg.imageTag = tsDNSCfg.Spec.Nameserver.Image.Tag
 	}
+	if tsDNSCfg.Spec.Nameserver.Service != nil {
+		dCfg.clusterIP = tsDNSCfg.Spec.Nameserver.Service.ClusterIP
+	}
+	if tsDNSCfg.Spec.Nameserver.Pod != nil {
+		dCfg.tolerations = tsDNSCfg.Spec.Nameserver.Pod.Tolerations
+		dCfg.affinity = tsDNSCfg.Spec.Nameserver.Pod.Affinity
+		dCfg.nodeSelector = tsDNSCfg.Spec.Nameserver.Pod.NodeSelector
+	}
+
 	for _, deployable := range []deployable{saDeployable, deployDeployable, svcDeployable, cmDeployable} {
 		if err := deployable.updateObj(ctx, dCfg, a.Client); err != nil {
 			return fmt.Errorf("error reconciling %s: %w", deployable.kind, err)
@@ -208,11 +219,16 @@ type deployable struct {
 }
 
 type deployConfig struct {
-	imageRepo string
-	imageTag  string
-	labels    map[string]string
-	ownerRefs []metav1.OwnerReference
-	namespace string
+	replicas     int32
+	imageRepo    string
+	imageTag     string
+	labels       map[string]string
+	ownerRefs    []metav1.OwnerReference
+	namespace    string
+	clusterIP    string
+	tolerations  []corev1.Toleration
+	affinity     *corev1.Affinity
+	nodeSelector map[string]string
 }
 
 var (
@@ -232,10 +248,14 @@ var (
 			if err := yaml.Unmarshal(deployYaml, &d); err != nil {
 				return fmt.Errorf("error unmarshalling Deployment yaml: %w", err)
 			}
+			d.Spec.Replicas = new(cfg.replicas)
 			d.Spec.Template.Spec.Containers[0].Image = fmt.Sprintf("%s:%s", cfg.imageRepo, cfg.imageTag)
 			d.ObjectMeta.Namespace = cfg.namespace
 			d.ObjectMeta.Labels = cfg.labels
 			d.ObjectMeta.OwnerReferences = cfg.ownerRefs
+			d.Spec.Template.Spec.Tolerations = cfg.tolerations
+			d.Spec.Template.Spec.Affinity = cfg.affinity
+			d.Spec.Template.Spec.NodeSelector = cfg.nodeSelector
 			updateF := func(oldD *appsv1.Deployment) {
 				oldD.Spec = d.Spec
 			}
@@ -267,6 +287,7 @@ var (
 			svc.ObjectMeta.Labels = cfg.labels
 			svc.ObjectMeta.OwnerReferences = cfg.ownerRefs
 			svc.ObjectMeta.Namespace = cfg.namespace
+			svc.Spec.ClusterIP = cfg.clusterIP
 			_, err := createOrUpdate[corev1.Service](ctx, kubeClient, cfg.namespace, svc, func(*corev1.Service) {})
 			return err
 		},

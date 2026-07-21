@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package envknob provides access to environment-variable tweakable
@@ -28,18 +28,19 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
+	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/kube/kubetypes"
+	"tailscale.com/syncs"
 	"tailscale.com/types/opt"
 	"tailscale.com/version"
 	"tailscale.com/version/distro"
 )
 
 var (
-	mu sync.Mutex
+	mu syncs.Mutex
 	// +checklocks:mu
 	set = map[string]string{}
 	// +checklocks:mu
@@ -404,6 +405,9 @@ func SSHIgnoreTailnetPolicy() bool { return Bool("TS_DEBUG_SSH_IGNORE_TAILNET_PO
 // TKASkipSignatureCheck reports whether to skip node-key signature checking for development.
 func TKASkipSignatureCheck() bool { return Bool("TS_UNSAFE_SKIP_NKS_VERIFICATION") }
 
+// AssumeNetworkUp reports whether to assume network connectivity for development.
+func AssumeNetworkUp() bool { return Bool("TS_ASSUME_NETWORK_UP_FOR_TEST") }
+
 // App returns the tailscale app type of this instance, if set via
 // TS_INTERNAL_APP env var. TS_INTERNAL_APP can be used to set app type for
 // components that wrap tailscaled, such as containerboot. App type is intended
@@ -463,7 +467,12 @@ var allowRemoteUpdate = RegisterBool("TS_ALLOW_ADMIN_CONSOLE_REMOTE_UPDATE")
 // AllowsRemoteUpdate reports whether this node has opted-in to letting the
 // Tailscale control plane initiate a Tailscale update (e.g. on behalf of an
 // admin on the admin console).
-func AllowsRemoteUpdate() bool { return allowRemoteUpdate() }
+func AllowsRemoteUpdate() bool {
+	if !buildfeatures.HasClientUpdate {
+		return false
+	}
+	return allowRemoteUpdate()
+}
 
 // SetNoLogsNoSupport enables no-logs-no-support mode.
 func SetNoLogsNoSupport() {
@@ -474,6 +483,9 @@ func SetNoLogsNoSupport() {
 var notInInit atomic.Bool
 
 func assertNotInInit() {
+	if !buildfeatures.HasDebug {
+		return
+	}
 	if notInInit.Load() {
 		return
 	}
@@ -533,6 +545,11 @@ func ApplyDiskConfigError() error { return applyDiskConfigErr }
 //     for App Store builds
 //   - /etc/tailscale/tailscaled-env.txt for tailscaled-on-macOS (homebrew, etc)
 func ApplyDiskConfig() (err error) {
+	if runtime.GOOS == "linux" && !(buildfeatures.HasDebug || buildfeatures.HasSynology) {
+		// This function does nothing on Linux, unless you're
+		// using TS_DEBUG_ENV_FILE or are on Synology.
+		return nil
+	}
 	var f *os.File
 	defer func() {
 		if err != nil {
@@ -593,7 +610,7 @@ func getPlatformEnvFiles() []string {
 			filepath.Join(os.Getenv("ProgramData"), "Tailscale", "tailscaled-env.txt"),
 		}
 	case "linux":
-		if distro.Get() == distro.Synology {
+		if buildfeatures.HasSynology && distro.Get() == distro.Synology {
 			return []string{"/etc/tailscale/tailscaled-env.txt"}
 		}
 	case "darwin":

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package resolver
@@ -31,7 +31,8 @@ import (
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/dnsname"
-	"tailscale.com/util/eventbus"
+	"tailscale.com/util/eventbus/eventbustest"
+	"tailscale.com/util/set"
 )
 
 var (
@@ -353,10 +354,13 @@ func TestRDNSNameToIPv6(t *testing.T) {
 }
 
 func newResolver(t testing.TB) *Resolver {
+	bus := eventbustest.NewBus(t)
+	dialer := tsdial.NewDialer(netmon.NewStatic())
+	dialer.SetBus(bus)
 	return New(t.Logf,
 		nil, // no link selector
-		tsdial.NewDialer(netmon.NewStatic()),
-		new(health.Tracker),
+		dialer,
+		health.NewTracker(bus),
 		nil, // no control knobs
 	)
 }
@@ -386,12 +390,8 @@ func TestResolveLocal(t *testing.T) {
 		{"ns-nxdomain", "test3.ipn.dev.", dns.TypeNS, netip.Addr{}, dns.RCodeNameError},
 		{"onion-domain", "footest.onion.", dns.TypeA, netip.Addr{}, dns.RCodeNameError},
 		{"magicdns", dnsSymbolicFQDN, dns.TypeA, netip.MustParseAddr("100.100.100.100"), dns.RCodeSuccess},
-		{"via_hex", dnsname.FQDN("via-0xff.1.2.3.4."), dns.TypeAAAA, netip.MustParseAddr("fd7a:115c:a1e0:b1a:0:ff:1.2.3.4"), dns.RCodeSuccess},
-		{"via_dec", dnsname.FQDN("via-1.10.0.0.1."), dns.TypeAAAA, netip.MustParseAddr("fd7a:115c:a1e0:b1a:0:1:10.0.0.1"), dns.RCodeSuccess},
-		{"x_via_hex", dnsname.FQDN("4.3.2.1.via-0xff."), dns.TypeAAAA, netip.MustParseAddr("fd7a:115c:a1e0:b1a:0:ff:4.3.2.1"), dns.RCodeSuccess},
-		{"x_via_dec", dnsname.FQDN("1.0.0.10.via-1."), dns.TypeAAAA, netip.MustParseAddr("fd7a:115c:a1e0:b1a:0:1:1.0.0.10"), dns.RCodeSuccess},
 		{"via_invalid", dnsname.FQDN("via-."), dns.TypeAAAA, netip.Addr{}, dns.RCodeRefused},
-		{"via_invalid_2", dnsname.FQDN("2.3.4.5.via-."), dns.TypeAAAA, netip.Addr{}, dns.RCodeRefused},
+		{"via_invalid_2", dnsname.FQDN("2-3-4-5-via-."), dns.TypeAAAA, netip.Addr{}, dns.RCodeRefused},
 
 		// Hyphenated 4via6 format.
 		// Without any suffix domain:
@@ -421,6 +421,161 @@ func TestResolveLocal(t *testing.T) {
 			// Only check ip for non-err
 			if ip != tt.ip {
 				t.Errorf("ip = %v; want %v", ip, tt.ip)
+			}
+		})
+	}
+}
+
+func TestResolveLocalSubdomain(t *testing.T) {
+	r := newResolver(t)
+	defer r.Close()
+
+	// Configure with SubdomainHosts set for test1.ipn.dev
+	cfg := Config{
+		Hosts: map[dnsname.FQDN][]netip.Addr{
+			"test1.ipn.dev.": {testipv4},
+			"test2.ipn.dev.": {testipv6},
+		},
+		LocalDomains:   []dnsname.FQDN{"ipn.dev."},
+		SubdomainHosts: set.Of[dnsname.FQDN]("test1.ipn.dev."),
+	}
+	r.SetConfig(cfg)
+
+	tests := []struct {
+		name  string
+		qname dnsname.FQDN
+		qtype dns.Type
+		ip    netip.Addr
+		code  dns.RCode
+	}{
+		// Exact matches still work
+		{"exact-ipv4", "test1.ipn.dev.", dns.TypeA, testipv4, dns.RCodeSuccess},
+		{"exact-ipv6", "test2.ipn.dev.", dns.TypeAAAA, testipv6, dns.RCodeSuccess},
+
+		// Subdomain of test1 resolves (test1 has SubdomainHosts set)
+		{"subdomain-ipv4", "foo.test1.ipn.dev.", dns.TypeA, testipv4, dns.RCodeSuccess},
+		{"subdomain-deep", "bar.foo.test1.ipn.dev.", dns.TypeA, testipv4, dns.RCodeSuccess}, // Multi-level subdomain
+
+		// Subdomain of test2 does NOT resolve (test2 lacks SubdomainHosts)
+		{"subdomain-no-cap", "foo.test2.ipn.dev.", dns.TypeAAAA, netip.Addr{}, dns.RCodeNameError},
+
+		// Non-existent parent still returns NXDOMAIN
+		{"subdomain-no-parent", "foo.test3.ipn.dev.", dns.TypeA, netip.Addr{}, dns.RCodeNameError},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ip, code := r.resolveLocal(tt.qname, tt.qtype)
+			if code != tt.code {
+				t.Errorf("code = %v; want %v", code, tt.code)
+			}
+			if ip != tt.ip {
+				t.Errorf("ip = %v; want %v", ip, tt.ip)
+			}
+		})
+	}
+}
+
+// fakeMagicDNSHosts is a MagicDNSHosts for tests, serving from fixed maps.
+type fakeMagicDNSHosts struct {
+	hosts     map[dnsname.FQDN][]netip.Addr
+	subdomain set.Set[dnsname.FQDN]
+	ptr       map[netip.Addr]dnsname.FQDN
+}
+
+func (f fakeMagicDNSHosts) LookupHost(fqdn dnsname.FQDN) (ips []netip.Addr, ok bool) {
+	ips, ok = f.hosts[fqdn]
+	return ips, ok
+}
+
+func (f fakeMagicDNSHosts) LookupPTR(ip netip.Addr) (_ dnsname.FQDN, ok bool) {
+	name, ok := f.ptr[ip]
+	return name, ok
+}
+
+func (f fakeMagicDNSHosts) SubdomainHost(fqdn dnsname.FQDN) bool {
+	return f.subdomain.Contains(fqdn)
+}
+
+// Tests forward, subdomain, and reverse resolution served on demand
+// via the MagicDNSHosts hook, and that entries pushed via Config.Hosts
+// take precedence over the hook.
+func TestResolveLocalMagicDNSHosts(t *testing.T) {
+	r := newResolver(t)
+	defer r.Close()
+
+	r.SetConfig(Config{
+		Hosts: map[dnsname.FQDN][]netip.Addr{
+			"extra.ipn.dev.": {netip.MustParseAddr("100.100.1.1")},
+			"both.ipn.dev.":  {netip.MustParseAddr("100.100.2.2")},
+		},
+		LocalDomains: []dnsname.FQDN{"ipn.dev.", "64.100.in-addr.arpa."},
+	})
+	node4 := netip.MustParseAddr("100.64.0.7")
+	node6 := netip.MustParseAddr("fd7a:115c:a1e0::7")
+	r.SetMagicDNSHosts(fakeMagicDNSHosts{
+		hosts: map[dnsname.FQDN][]netip.Addr{
+			"node.ipn.dev.":   {node4, node6},
+			"v4only.ipn.dev.": {node4},
+			"subber.ipn.dev.": {node4},
+			"both.ipn.dev.":   {netip.MustParseAddr("100.100.9.9")}, // masked by Config.Hosts
+		},
+		subdomain: set.Of[dnsname.FQDN]("subber.ipn.dev."),
+		ptr:       map[netip.Addr]dnsname.FQDN{node4: "node.ipn.dev."},
+	})
+
+	tests := []struct {
+		name  string
+		qname dnsname.FQDN
+		qtype dns.Type
+		ip    netip.Addr
+		code  dns.RCode
+	}{
+		{"hook-ipv4", "node.ipn.dev.", dns.TypeA, node4, dns.RCodeSuccess},
+		{"hook-ipv6", "node.ipn.dev.", dns.TypeAAAA, node6, dns.RCodeSuccess},
+		// A known name with no records of the queried family is
+		// "name exists, no records", not NXDOMAIN.
+		{"hook-no-ipv6", "v4only.ipn.dev.", dns.TypeAAAA, netip.Addr{}, dns.RCodeSuccess},
+		{"hook-nxdomain", "gone.ipn.dev.", dns.TypeA, netip.Addr{}, dns.RCodeNameError},
+		{"hook-foreign", "google.com.", dns.TypeA, netip.Addr{}, dns.RCodeRefused},
+		{"hook-subdomain", "foo.subber.ipn.dev.", dns.TypeA, node4, dns.RCodeSuccess},
+		{"hook-subdomain-deep", "bar.foo.subber.ipn.dev.", dns.TypeA, node4, dns.RCodeSuccess},
+		{"hook-subdomain-no-cap", "foo.node.ipn.dev.", dns.TypeA, netip.Addr{}, dns.RCodeNameError},
+		// Config.Hosts entries (control's ExtraRecords) are
+		// consulted before the hook.
+		{"config-hosts", "extra.ipn.dev.", dns.TypeA, netip.MustParseAddr("100.100.1.1"), dns.RCodeSuccess},
+		{"config-hosts-precedence", "both.ipn.dev.", dns.TypeA, netip.MustParseAddr("100.100.2.2"), dns.RCodeSuccess},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ip, code := r.resolveLocal(tt.qname, tt.qtype)
+			if code != tt.code {
+				t.Errorf("code = %v; want %v", code, tt.code)
+			}
+			if ip != tt.ip {
+				t.Errorf("ip = %v; want %v", ip, tt.ip)
+			}
+		})
+	}
+
+	revTests := []struct {
+		name string
+		q    dnsname.FQDN
+		want dnsname.FQDN
+		code dns.RCode
+	}{
+		{"hook-ptr", "7.0.64.100.in-addr.arpa.", "node.ipn.dev.", dns.RCodeSuccess},
+		{"hook-ptr-nxdomain", "8.0.64.100.in-addr.arpa.", "", dns.RCodeNameError},
+		{"hook-ptr-foreign", "5.4.3.2.in-addr.arpa.", "", dns.RCodeRefused},
+	}
+	for _, tt := range revTests {
+		t.Run(tt.name, func(t *testing.T) {
+			name, code := r.resolveLocalReverse(tt.q)
+			if code != tt.code {
+				t.Errorf("code = %v; want %v", code, tt.code)
+			}
+			if name != tt.want {
+				t.Errorf("name = %v; want %v", name, tt.want)
 			}
 		})
 	}
@@ -1060,8 +1215,7 @@ func TestForwardLinkSelection(t *testing.T) {
 	// routes differently.
 	specialIP := netaddr.IPv4(1, 2, 3, 4)
 
-	bus := eventbus.New()
-	defer bus.Close()
+	bus := eventbustest.NewBus(t)
 
 	netMon, err := netmon.New(bus, logger.WithPrefix(t.Logf, ".... netmon: "))
 	if err != nil {
@@ -1074,7 +1228,7 @@ func TestForwardLinkSelection(t *testing.T) {
 			return "special"
 		}
 		return ""
-	}), new(tsdial.Dialer), new(health.Tracker), nil /* no control knobs */)
+	}), new(tsdial.Dialer), health.NewTracker(bus), nil /* no control knobs */)
 
 	// Test non-special IP.
 	if got, err := fwd.packetListener(netip.Addr{}); err != nil {
@@ -1106,10 +1260,6 @@ type linkSelFunc func(ip netip.Addr) string
 func (f linkSelFunc) PickLink(ip netip.Addr) string { return f(ip) }
 
 func TestHandleExitNodeDNSQueryWithNetPkg(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("skipping test on Windows; waiting for golang.org/issue/33097")
-	}
-
 	records := []any{
 		"no-records.test.",
 		dnsHandler(),
@@ -1405,9 +1555,6 @@ func TestHandleExitNodeDNSQueryWithNetPkg(t *testing.T) {
 // newWrapResolver returns a resolver that uses r (via handleExitNodeDNSQueryWithNetPkg)
 // to make DNS requests.
 func newWrapResolver(r *net.Resolver) *net.Resolver {
-	if runtime.GOOS == "windows" {
-		panic("doesn't work on Windows") // golang.org/issue/33097
-	}
 	return &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -1511,18 +1658,115 @@ func TestServfail(t *testing.T) {
 		t.Fatalf("err = %v, want nil", err)
 	}
 
+	// The upstream server's SERVFAIL bytes are returned directly.
 	wantPkt := []byte{
 		0x00, 0x00, // transaction id: 0
-		0x84, 0x02, // flags: response, authoritative, error: servfail
-		0x00, 0x01, // one question
+		0x00, 0x02, // flags: error: servfail
+		0x00, 0x00, // no questions (upstream sent a minimal response)
 		0x00, 0x00, // no answers
 		0x00, 0x00, 0x00, 0x00, // no authority or additional RRs
-		// Question:
-		0x04, 0x74, 0x65, 0x73, 0x74, 0x04, 0x73, 0x69, 0x74, 0x65, 0x00, // name
-		0x00, 0x01, 0x00, 0x01, // type A, class IN
 	}
 
 	if !bytes.Equal(pkt, wantPkt) {
 		t.Errorf("response was %X, want %X", pkt, wantPkt)
+	}
+}
+
+// TestLocalResponseTCFlagIntegration tests that checkResponseSizeAndSetTC is
+// correctly applied to local DNS responses through the Resolver.Query integration path.
+// This complements the unit test in forwarder_test.go by verifying the end-to-end behavior.
+func TestLocalResponseTCFlagIntegration(t *testing.T) {
+	r := newResolver(t)
+	defer r.Close()
+
+	r.SetConfig(dnsCfg)
+
+	tests := []struct {
+		name      string
+		query     []byte
+		family    string
+		wantTCSet bool
+		desc      string
+	}{
+		{
+			name:      "UDP_small_local_response_no_TC",
+			query:     dnspacket("test1.ipn.dev.", dns.TypeA, noEdns),
+			family:    "udp",
+			wantTCSet: false,
+			desc:      "Small local response (< 512 bytes) should not have TC flag set",
+		},
+		{
+			name:      "TCP_local_response_no_TC",
+			query:     dnspacket("test1.ipn.dev.", dns.TypeA, noEdns),
+			family:    "tcp",
+			wantTCSet: false,
+			desc:      "TCP queries should skip TC flag setting (even for large responses)",
+		},
+		{
+			name:      "UDP_EDNS_request_small_response",
+			query:     dnspacket("test1.ipn.dev.", dns.TypeA, 1500),
+			family:    "udp",
+			wantTCSet: false,
+			desc:      "Small response with EDNS request should not have TC flag set",
+		},
+		{
+			name:      "UDP_IPv6_response_no_TC",
+			query:     dnspacket("test2.ipn.dev.", dns.TypeAAAA, noEdns),
+			family:    "udp",
+			wantTCSet: false,
+			desc:      "Small IPv6 local response should not have TC flag set",
+		},
+		{
+			name:      "UDP_reverse_lookup_no_TC",
+			query:     dnspacket("4.3.2.1.in-addr.arpa.", dns.TypePTR, noEdns),
+			family:    "udp",
+			wantTCSet: false,
+			desc:      "Small reverse lookup response should not have TC flag set",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			response, err := r.Query(context.Background(), tt.query, tt.family, netip.AddrPort{})
+			if err != nil {
+				t.Fatalf("Query failed: %v", err)
+			}
+
+			if len(response) < headerBytes {
+				t.Fatalf("Response too small: %d bytes", len(response))
+			}
+
+			hasTC := truncatedFlagSet(response)
+			if hasTC != tt.wantTCSet {
+				t.Errorf("%s: TC flag = %v, want %v (response size=%d bytes)", tt.desc, hasTC, tt.wantTCSet, len(response))
+			}
+
+			// Verify response is valid by parsing it (if possible)
+			// Note: unpackResponse may not support all record types (e.g., PTR)
+			parsed, err := unpackResponse(response)
+			if err == nil {
+				// Verify the truncated field in parsed response matches the flag
+				if parsed.truncated != hasTC {
+					t.Errorf("Parsed truncated field (%v) doesn't match TC flag (%v)", parsed.truncated, hasTC)
+				}
+			} else {
+				// For unsupported types, just verify we can parse the header
+				var parser dns.Parser
+				h, err := parser.Start(response)
+				if err != nil {
+					t.Errorf("Failed to parse DNS header: %v", err)
+				} else {
+					// Verify header truncated flag matches
+					if h.Truncated != hasTC {
+						t.Errorf("Header truncated field (%v) doesn't match TC flag (%v)", h.Truncated, hasTC)
+					}
+				}
+			}
+
+			// Verify response size is reasonable (local responses are typically small)
+			if len(response) > 1000 {
+				t.Logf("Warning: Local response is unusually large: %d bytes", len(response))
+			}
+		})
 	}
 }

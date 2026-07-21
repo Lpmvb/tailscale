@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Both the desktop session manager and multi-user support
@@ -18,11 +18,12 @@ import (
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnext"
 	"tailscale.com/types/logger"
-	"tailscale.com/util/syspolicy"
+	"tailscale.com/util/syspolicy/pkey"
+	"tailscale.com/util/syspolicy/policyclient"
 )
 
 // featureName is the name of the feature implemented by this package.
-// It is also the the [desktopSessionsExt] name and the log prefix.
+// It is also the [desktopSessionsExt] name and the log prefix.
 const featureName = "desktop-sessions"
 
 func init() {
@@ -135,7 +136,7 @@ func (e *desktopSessionsExt) getBackgroundProfile(profiles ipnext.ProfileStore) 
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if alwaysOn, _ := syspolicy.GetBoolean(syspolicy.AlwaysOn, false); !alwaysOn {
+	if alwaysOn, _ := policyclient.Get().GetBoolean(pkey.AlwaysOn, false); !alwaysOn {
 		// If the Always-On mode is disabled, there's no background profile
 		// as far as the desktop session extension is concerned.
 		return ipn.LoginProfileView{}

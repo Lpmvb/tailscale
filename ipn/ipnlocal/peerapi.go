@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package ipnlocal
@@ -16,7 +16,6 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
-	"path/filepath"
 	"runtime"
 	"slices"
 	"strconv"
@@ -26,11 +25,11 @@ import (
 
 	"golang.org/x/net/dns/dnsmessage"
 	"golang.org/x/net/http/httpguts"
-	"tailscale.com/drive"
 	"tailscale.com/envknob"
+	"tailscale.com/feature"
+	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/health"
 	"tailscale.com/hostinfo"
-	"tailscale.com/ipn"
 	"tailscale.com/net/netaddr"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/netutil"
@@ -39,19 +38,12 @@ import (
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/views"
 	"tailscale.com/util/clientmetric"
-	"tailscale.com/util/httpm"
 	"tailscale.com/wgengine/filter"
 )
 
-const (
-	taildrivePrefix = "/v0/drive"
-)
-
-var initListenConfig func(*net.ListenConfig, netip.Addr, *netmon.State, string) error
-
-// addH2C is non-nil on platforms where we want to add H2C
-// ("cleartext" HTTP/2) support to the peerAPI.
-var addH2C func(*http.Server)
+// initListenConfig, if non-nil, is called during peerAPIListener setup.  It is used only
+// on iOS and macOS to set socket options to bind the listener to the Tailscale interface.
+var initListenConfig func(config *net.ListenConfig, addr netip.Addr, tunIfIndex int) error
 
 // peerDNSQueryHandler is implemented by tsdns.Resolver.
 type peerDNSQueryHandler interface {
@@ -63,7 +55,7 @@ type peerAPIServer struct {
 	resolver peerDNSQueryHandler
 }
 
-func (s *peerAPIServer) listen(ip netip.Addr, ifState *netmon.State) (ln net.Listener, err error) {
+func (s *peerAPIServer) listen(ip netip.Addr, tunIfIndex int) (ln net.Listener, err error) {
 	// Android for whatever reason often has problems creating the peerapi listener.
 	// But since we started intercepting it with netstack, it's not even important that
 	// we have a real kernel-level listener. So just create a dummy listener on Android
@@ -79,7 +71,14 @@ func (s *peerAPIServer) listen(ip netip.Addr, ifState *netmon.State) (ln net.Lis
 		// On iOS/macOS, this sets the lc.Control hook to
 		// setsockopt the interface index to bind to, to get
 		// out of the network sandbox.
-		if err := initListenConfig(&lc, ip, ifState, s.b.dialer.TUNName()); err != nil {
+
+		// A zero tunIfIndex is invalid for peerapi.  A zero value will not get us
+		// out of the network sandbox.  Caller should log and retry.
+		if tunIfIndex == 0 {
+			return nil, fmt.Errorf("peerapi: cannot listen on %s with tunIfIndex 0", ipStr)
+		}
+
+		if err := initListenConfig(&lc, ip, tunIfIndex); err != nil {
 			return nil, err
 		}
 		if runtime.GOOS == "darwin" || runtime.GOOS == "ios" {
@@ -104,7 +103,7 @@ func (s *peerAPIServer) listen(ip netip.Addr, ifState *netmon.State) (ln net.Lis
 	// deterministic that people will bake this into clients.
 	// We try a few times just in case something's already
 	// listening on that port (on all interfaces, probably).
-	for try := uint8(0); try < 5; try++ {
+	for try := range uint8(5) {
 		a16 := ip.As16()
 		hashData := a16[len(a16)-3:]
 		hashData[0] += try
@@ -142,6 +141,9 @@ type peerAPIListener struct {
 }
 
 func (pln *peerAPIListener) Close() error {
+	if !buildfeatures.HasPeerAPIServer {
+		return nil
+	}
 	if pln.ln != nil {
 		return pln.ln.Close()
 	}
@@ -149,6 +151,9 @@ func (pln *peerAPIListener) Close() error {
 }
 
 func (pln *peerAPIListener) serve() {
+	if !buildfeatures.HasPeerAPIServer {
+		return
+	}
 	if pln.ln == nil {
 		return
 	}
@@ -187,7 +192,7 @@ func (pln *peerAPIListener) ServeConn(src netip.AddrPort, c net.Conn) {
 		c.Close()
 		return
 	}
-	nm := pln.lb.NetMap()
+	nm := pln.lb.NetMapNoPeers()
 	if nm == nil || !nm.SelfNode.Valid() {
 		logf("peerapi: no netmap")
 		c.Close()
@@ -202,11 +207,11 @@ func (pln *peerAPIListener) ServeConn(src netip.AddrPort, c net.Conn) {
 		peerUser:   peerUser,
 	}
 	httpServer := &http.Server{
-		Handler: h,
+		Handler:   h,
+		Protocols: new(http.Protocols),
 	}
-	if addH2C != nil {
-		addH2C(httpServer)
-	}
+	httpServer.Protocols.SetHTTP1(true)
+	httpServer.Protocols.SetUnencryptedHTTP2(true) // over WireGuard; "unencrypted" means no TLS
 	go httpServer.Serve(netutil.NewOneConnListener(c, nil))
 }
 
@@ -225,6 +230,7 @@ type peerAPIHandler struct {
 type PeerAPIHandler interface {
 	Peer() tailcfg.NodeView
 	PeerCaps() tailcfg.PeerCapMap
+	CanDebug() bool // can remote node can debug this node (internal state, etc)
 	Self() tailcfg.NodeView
 	LocalBackend() *LocalBackend
 	IsSelfUntagged() bool // whether the peer is untagged and the same as this user
@@ -245,6 +251,10 @@ func (h *peerAPIHandler) Logf(format string, a ...any) {
 
 func (h *peerAPIHandler) logf(format string, a ...any) {
 	h.ps.b.logf("peerapi: "+format, a...)
+}
+
+func (h *peerAPIHandler) logfv1(format string, a ...any) {
+	h.ps.b.logf("[v1] peerapi: "+format, a...)
 }
 
 // isAddressValid reports whether addr is a valid destination address for this
@@ -325,6 +335,9 @@ func peerAPIRequestShouldGetSecurityHeaders(r *http.Request) bool {
 //
 // It panics if the path is already registered.
 func RegisterPeerAPIHandler(path string, f func(PeerAPIHandler, http.ResponseWriter, *http.Request)) {
+	if !buildfeatures.HasPeerAPIServer {
+		return
+	}
 	if _, ok := peerAPIHandlers[path]; ok {
 		panic(fmt.Sprintf("duplicate PeerAPI handler %q", path))
 	}
@@ -343,6 +356,10 @@ var (
 )
 
 func (h *peerAPIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !buildfeatures.HasPeerAPIServer {
+		http.Error(w, feature.ErrUnavailable.Error(), http.StatusNotImplemented)
+		return
+	}
 	if err := h.validatePeerAPIRequest(r); err != nil {
 		metricInvalidRequests.Add(1)
 		h.logf("invalid request from %v: %v", h.remoteAddr, err)
@@ -360,44 +377,35 @@ func (h *peerAPIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if strings.HasPrefix(r.URL.Path, "/dns-query") {
+	if buildfeatures.HasDNS && strings.HasPrefix(r.URL.Path, "/dns-query") {
 		metricDNSCalls.Add(1)
 		h.handleDNSQuery(w, r)
 		return
 	}
-	if strings.HasPrefix(r.URL.Path, taildrivePrefix) {
-		h.handleServeDrive(w, r)
-		return
-	}
-	switch r.URL.Path {
-	case "/v0/goroutines":
-		h.handleServeGoroutines(w, r)
-		return
-	case "/v0/env":
-		h.handleServeEnv(w, r)
-		return
-	case "/v0/metrics":
-		h.handleServeMetrics(w, r)
-		return
-	case "/v0/magicsock":
-		h.handleServeMagicsock(w, r)
-		return
-	case "/v0/dnsfwd":
-		h.handleServeDNSFwd(w, r)
-		return
-	case "/v0/interfaces":
-		h.handleServeInterfaces(w, r)
-		return
-	case "/v0/doctor":
-		h.handleServeDoctor(w, r)
-		return
-	case "/v0/sockstats":
-		h.handleServeSockStats(w, r)
-		return
-	case "/v0/ingress":
-		metricIngressCalls.Add(1)
-		h.handleServeIngress(w, r)
-		return
+	if buildfeatures.HasDebug {
+		switch r.URL.Path {
+		case "/v0/goroutines":
+			h.handleServeGoroutines(w, r)
+			return
+		case "/v0/env":
+			h.handleServeEnv(w, r)
+			return
+		case "/v0/metrics":
+			h.handleServeMetrics(w, r)
+			return
+		case "/v0/magicsock":
+			h.handleServeMagicsock(w, r)
+			return
+		case "/v0/dnsfwd":
+			h.handleServeDNSFwd(w, r)
+			return
+		case "/v0/interfaces":
+			h.handleServeInterfaces(w, r)
+			return
+		case "/v0/sockstats":
+			h.handleServeSockStats(w, r)
+			return
+		}
 	}
 	if ph, ok := peerAPIHandlers[r.URL.Path]; ok {
 		ph(h, w, r)
@@ -418,67 +426,6 @@ This is my Tailscale device. Your device is %v.
 	if h.isSelf {
 		fmt.Fprintf(w, "<p>You are the owner of this node.\n")
 	}
-}
-
-func (h *peerAPIHandler) handleServeIngress(w http.ResponseWriter, r *http.Request) {
-	// http.Errors only useful if hitting endpoint manually
-	// otherwise rely on log lines when debugging ingress connections
-	// as connection is hijacked for bidi and is encrypted tls
-	if !h.canIngress() {
-		h.logf("ingress: denied; no ingress cap from %v", h.remoteAddr)
-		http.Error(w, "denied; no ingress cap", http.StatusForbidden)
-		return
-	}
-	logAndError := func(code int, publicMsg string) {
-		h.logf("ingress: bad request from %v: %s", h.remoteAddr, publicMsg)
-		http.Error(w, publicMsg, code)
-	}
-	bad := func(publicMsg string) {
-		logAndError(http.StatusBadRequest, publicMsg)
-	}
-	if r.Method != "POST" {
-		logAndError(http.StatusMethodNotAllowed, "only POST allowed")
-		return
-	}
-	srcAddrStr := r.Header.Get("Tailscale-Ingress-Src")
-	if srcAddrStr == "" {
-		bad("Tailscale-Ingress-Src header not set")
-		return
-	}
-	srcAddr, err := netip.ParseAddrPort(srcAddrStr)
-	if err != nil {
-		bad("Tailscale-Ingress-Src header invalid; want ip:port")
-		return
-	}
-	target := ipn.HostPort(r.Header.Get("Tailscale-Ingress-Target"))
-	if target == "" {
-		bad("Tailscale-Ingress-Target header not set")
-		return
-	}
-	if _, _, err := net.SplitHostPort(string(target)); err != nil {
-		bad("Tailscale-Ingress-Target header invalid; want host:port")
-		return
-	}
-
-	getConnOrReset := func() (net.Conn, bool) {
-		conn, _, err := w.(http.Hijacker).Hijack()
-		if err != nil {
-			h.logf("ingress: failed hijacking conn")
-			http.Error(w, "failed hijacking conn", http.StatusInternalServerError)
-			return nil, false
-		}
-		io.WriteString(conn, "HTTP/1.1 101 Switching Protocols\r\n\r\n")
-		return &ipn.FunnelConn{
-			Conn:   conn,
-			Src:    srcAddr,
-			Target: target,
-		}, true
-	}
-	sendRST := func() {
-		http.Error(w, "denied", http.StatusForbidden)
-	}
-
-	h.ps.b.HandleIngressTCPConn(h.peerNode, target, srcAddr, getConnOrReset, sendRST)
 }
 
 func (h *peerAPIHandler) handleServeInterfaces(w http.ResponseWriter, r *http.Request) {
@@ -526,24 +473,6 @@ func (h *peerAPIHandler) handleServeInterfaces(w http.ResponseWriter, r *http.Re
 		fmt.Fprint(w, "</tr>\n")
 	})
 	fmt.Fprintln(w, "</table>")
-}
-
-func (h *peerAPIHandler) handleServeDoctor(w http.ResponseWriter, r *http.Request) {
-	if !h.canDebug() {
-		http.Error(w, "denied; no debug access", http.StatusForbidden)
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprintln(w, "<h1>Doctor Output</h1>")
-
-	fmt.Fprintln(w, "<pre>")
-
-	h.ps.b.Doctor(r.Context(), func(format string, args ...any) {
-		line := fmt.Sprintf(format, args...)
-		fmt.Fprintln(w, html.EscapeString(line))
-	})
-
-	fmt.Fprintln(w, "</pre>")
 }
 
 func (h *peerAPIHandler) handleServeSockStats(w http.ResponseWriter, r *http.Request) {
@@ -644,6 +573,8 @@ func (h *peerAPIHandler) handleServeSockStats(w http.ResponseWriter, r *http.Req
 	fmt.Fprintln(w, "</pre>")
 }
 
+func (h *peerAPIHandler) CanDebug() bool { return h.canDebug() }
+
 // canDebug reports whether h can debug this node (goroutines, metrics,
 // magicsock internal state, etc).
 func (h *peerAPIHandler) canDebug() bool {
@@ -727,6 +658,10 @@ func (h *peerAPIHandler) handleServeMetrics(w http.ResponseWriter, r *http.Reque
 }
 
 func (h *peerAPIHandler) handleServeDNSFwd(w http.ResponseWriter, r *http.Request) {
+	if !buildfeatures.HasDNS {
+		http.NotFound(w, r)
+		return
+	}
 	if !h.canDebug() {
 		http.Error(w, "denied; no debug access", http.StatusForbidden)
 		return
@@ -739,21 +674,49 @@ func (h *peerAPIHandler) handleServeDNSFwd(w http.ResponseWriter, r *http.Reques
 	dh.ServeHTTP(w, r)
 }
 
+// HookReplyToDNSQueries allows extensions to register a willingness to allow
+// handling PeerAPI DNS queries for the peer making this request.
+var HookReplyToDNSQueries = feature.Hooks[func(PeerAPIHandler) bool]{
+	offersExitNodeOrAppConnectorAndPeerHasAutogroupInternet,
+}
+
 func (h *peerAPIHandler) replyToDNSQueries() bool {
+	if !buildfeatures.HasDNS {
+		return false
+	}
 	if h.isSelf {
 		// If the peer is owned by the same user, just allow it
 		// without further checks.
 		return true
 	}
-	b := h.ps.b
-	if !b.OfferingExitNode() && !b.OfferingAppConnector() {
-		// If we're not an exit node or app connector, there's
-		// no point to being a DNS server for somebody.
-		return false
-	}
 	if !h.remoteAddr.IsValid() {
 		// This should never be the case if the peerAPIHandler
 		// was wired up correctly, but just in case.
+		return false
+	}
+
+	for _, hook := range HookReplyToDNSQueries {
+		if hook(h) {
+			return true
+		}
+	}
+	return false
+}
+
+// offersExitNodeOrAppConnectorAndPeerHasAutogroupInternet is run as part of
+// [HookReplyToDNSQueries] and handles our legacy PeerAPI DNS acceptance
+// criteria:
+//   - When a node is advertising an exit node it will accept DNS queries
+//     from peers that have access to autogroup:internet.
+//   - When a node is advertising an app connector, it will accept DNS queries
+//     to peers that have access to a relevant app.
+//
+// Further details about how these are accomplished are in inline comments.
+func offersExitNodeOrAppConnectorAndPeerHasAutogroupInternet(h PeerAPIHandler) bool {
+	b := h.LocalBackend()
+	if !b.OfferingExitNode() && !b.OfferingAppConnector() {
+		// If we're not an exit node or app connector, this hook
+		// doesn't apply.
 		return false
 	}
 	// Otherwise, we're an exit node but the peer is not us, so
@@ -778,7 +741,7 @@ func (h *peerAPIHandler) replyToDNSQueries() bool {
 	// arbitrary. DNS runs over TCP and UDP, so sure... we check
 	// TCP.
 	dstIP := netaddr.IPv4(0, 0, 0, 0)
-	remoteIP := h.remoteAddr.Addr()
+	remoteIP := h.RemoteAddr().Addr()
 	if remoteIP.Is6() {
 		// autogroup:internet for IPv6 is defined to start with 2000::/3,
 		// so use 2000::0 as the probe "the internet" address.
@@ -791,7 +754,7 @@ func (h *peerAPIHandler) replyToDNSQueries() bool {
 // handleDNSQuery implements a DoH server (RFC 8484) over the peerapi.
 // It's not over HTTPS as the spec dictates, but rather HTTP-over-WireGuard.
 func (h *peerAPIHandler) handleDNSQuery(w http.ResponseWriter, r *http.Request) {
-	if h.ps.resolver == nil {
+	if !buildfeatures.HasDNS || h.ps.resolver == nil {
 		http.Error(w, "DNS not wired up", http.StatusNotImplemented)
 		return
 	}
@@ -832,7 +795,7 @@ func (h *peerAPIHandler) handleDNSQuery(w http.ResponseWriter, r *http.Request) 
 	// TODO(raggi): consider pushing the integration down into the resolver
 	// instead to avoid re-parsing the DNS response for improved performance in
 	// the future.
-	if h.ps.b.OfferingAppConnector() {
+	if buildfeatures.HasAppConnectors && h.ps.b.OfferingAppConnector() {
 		if err := h.ps.b.ObserveDNSResponse(res); err != nil {
 			h.logf("ObserveDNSResponse error: %v", err)
 			// This is not fatal, we probably just failed to parse the upstream
@@ -859,7 +822,7 @@ func dohQuery(r *http.Request) (dnsQuery []byte, publicErr string) {
 	case "GET":
 		q64 := r.FormValue("dns")
 		if q64 == "" {
-			return nil, "missing 'dns' parameter"
+			return nil, "missing ‘dns’ parameter; try '?dns=' (DoH standard) or use '?q=<name>' for JSON debug mode"
 		}
 		if base64.RawURLEncoding.DecodedLen(len(q64)) > maxQueryLen {
 			return nil, "query too large"
@@ -1014,87 +977,6 @@ func (rbw *requestBodyWrapper) Read(b []byte) (int, error) {
 	return n, err
 }
 
-func (h *peerAPIHandler) handleServeDrive(w http.ResponseWriter, r *http.Request) {
-	if !h.ps.b.DriveSharingEnabled() {
-		h.logf("taildrive: not enabled")
-		http.Error(w, "taildrive not enabled", http.StatusNotFound)
-		return
-	}
-
-	capsMap := h.PeerCaps()
-	driveCaps, ok := capsMap[tailcfg.PeerCapabilityTaildrive]
-	if !ok {
-		h.logf("taildrive: not permitted")
-		http.Error(w, "taildrive not permitted", http.StatusForbidden)
-		return
-	}
-
-	rawPerms := make([][]byte, 0, len(driveCaps))
-	for _, cap := range driveCaps {
-		rawPerms = append(rawPerms, []byte(cap))
-	}
-
-	p, err := drive.ParsePermissions(rawPerms)
-	if err != nil {
-		h.logf("taildrive: error parsing permissions: %v", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	fs, ok := h.ps.b.sys.DriveForRemote.GetOK()
-	if !ok {
-		h.logf("taildrive: not supported on platform")
-		http.Error(w, "taildrive not supported on platform", http.StatusNotFound)
-		return
-	}
-	wr := &httpResponseWrapper{
-		ResponseWriter: w,
-	}
-	bw := &requestBodyWrapper{
-		ReadCloser: r.Body,
-	}
-	r.Body = bw
-
-	if r.Method == httpm.PUT || r.Method == httpm.GET {
-		defer func() {
-			switch wr.statusCode {
-			case 304:
-				// 304s are particularly chatty so skip logging.
-			default:
-				contentType := "unknown"
-				if ct := wr.Header().Get("Content-Type"); ct != "" {
-					contentType = ct
-				}
-
-				h.logf("taildrive: share: %s from %s to %s: status-code=%d ext=%q content-type=%q tx=%.f rx=%.f", r.Method, h.peerNode.Key().ShortString(), h.selfNode.Key().ShortString(), wr.statusCode, parseDriveFileExtensionForLog(r.URL.Path), contentType, roundTraffic(wr.contentLength), roundTraffic(bw.bytesRead))
-			}
-		}()
-	}
-
-	r.URL.Path = strings.TrimPrefix(r.URL.Path, taildrivePrefix)
-	fs.ServeHTTPWithPerms(p, wr, r)
-}
-
-// parseDriveFileExtensionForLog parses the file extension, if available.
-// If a file extension is not present or parsable, the file extension is
-// set to "unknown". If the file extension contains a double quote, it is
-// replaced with "removed".
-// All whitespace is removed from a parsed file extension.
-// File extensions including the leading ., e.g. ".gif".
-func parseDriveFileExtensionForLog(path string) string {
-	fileExt := "unknown"
-	if fe := filepath.Ext(path); fe != "" {
-		if strings.Contains(fe, "\"") {
-			// Do not log include file extensions with quotes within them.
-			return "removed"
-		}
-		// Remove white space from user defined inputs.
-		fileExt = strings.ReplaceAll(fe, " ", "")
-	}
-
-	return fileExt
-}
-
 // peerAPIURL returns an HTTP URL for the peer's peerapi service,
 // without a trailing slash.
 //
@@ -1187,6 +1069,5 @@ var (
 	metricInvalidRequests = clientmetric.NewCounter("peerapi_invalid_requests")
 
 	// Non-debug PeerAPI endpoints.
-	metricDNSCalls     = clientmetric.NewCounter("peerapi_dns")
-	metricIngressCalls = clientmetric.NewCounter("peerapi_ingress")
+	metricDNSCalls = clientmetric.NewCounter("peerapi_dns")
 )

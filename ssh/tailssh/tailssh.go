@@ -1,7 +1,7 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
-//go:build linux || (darwin && !ios) || freebsd || openbsd || plan9
+//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd || plan9
 
 // Package tailssh is an SSH server integrated into Tailscale.
 package tailssh
@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/netip"
@@ -21,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -29,18 +31,20 @@ import (
 	"syscall"
 	"time"
 
-	gossh "golang.org/x/crypto/ssh"
+	gliderssh "github.com/tailscale/gliderssh"
+	"golang.org/x/crypto/ssh"
 	"tailscale.com/envknob"
+	"tailscale.com/feature"
 	"tailscale.com/ipn/ipnlocal"
-	"tailscale.com/logtail/backoff"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/sessionrecording"
 	"tailscale.com/tailcfg"
-	"tailscale.com/tempfork/gliderlabs/ssh"
+	"tailscale.com/tstime"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
+	"tailscale.com/util/backoff"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/httpm"
 	"tailscale.com/util/mak"
@@ -52,10 +56,16 @@ var (
 	sshDisableForwarding = envknob.RegisterBool("TS_SSH_DISABLE_FORWARDING")
 	sshDisablePTY        = envknob.RegisterBool("TS_SSH_DISABLE_PTY")
 
-	// errTerminal is an empty gossh.PartialSuccessError (with no 'Next'
+	// errTerminal is an empty ssh.PartialSuccessError (with no 'Next'
 	// authentication methods that may proceed), which results in the SSH
 	// server immediately disconnecting the client.
-	errTerminal = &gossh.PartialSuccessError{}
+	errTerminal = &ssh.PartialSuccessError{}
+
+	// hookSSHLoginSuccess is called after successful SSH authentication.
+	// It is set by platform-specific code (e.g., auditd_linux.go).
+	hookSSHLoginSuccess feature.Hook[func(logf logger.Logf, c *conn)]
+
+	uidRegex = regexp.MustCompile("^[0-9]+$")
 )
 
 const (
@@ -68,9 +78,9 @@ const (
 // ipnLocalBackend is the subset of ipnlocal.LocalBackend that we use.
 // It is used for testing.
 type ipnLocalBackend interface {
-	GetSSH_HostKeys() ([]gossh.Signer, error)
 	ShouldRunSSH() bool
 	NetMap() *netmap.NetworkMap
+	NetMapNoPeers() *netmap.NetworkMap
 	WhoIs(proto string, ipp netip.AddrPort) (n tailcfg.NodeView, u tailcfg.UserProfile, ok bool)
 	DoNoiseRequest(req *http.Request) (*http.Response, error)
 	Dialer() *tsdial.Dialer
@@ -101,6 +111,8 @@ func (srv *server) now() time.Time {
 }
 
 func init() {
+	feature.HookGetSSHHostKeyPublicStrings.Set(getHostKeyPublicStrings)
+	ipnlocal.RegisterC2N("/ssh/usernames", handleC2NSSHUsernames)
 	ipnlocal.RegisterNewSSHServer(func(logf logger.Logf, lb *ipnlocal.LocalBackend) (ipnlocal.SSHServer, error) {
 		tsd, err := os.Executable()
 		if err != nil {
@@ -187,9 +199,9 @@ func (srv *server) OnPolicyChange() {
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
 	for c := range srv.activeConns {
-		if c.info == nil {
-			// c.info is nil when the connection hasn't been authenticated yet.
-			// In that case, the connection will be terminated when it is.
+		if !c.authCompleted.Load() {
+			// The connection hasn't completed authentication yet.
+			// In that case, the connection will be terminated when it does.
 			continue
 		}
 		go c.checkStillValid()
@@ -197,7 +209,7 @@ func (srv *server) OnPolicyChange() {
 }
 
 // conn represents a single SSH connection and its associated
-// ssh.Server.
+// gliderssh.Server.
 //
 // During the lifecycle of a connection, the following are called in order:
 // Setup and discover server info
@@ -213,9 +225,9 @@ func (srv *server) OnPolicyChange() {
 // channels concurrently. At which point any of the following can be called
 // in any order.
 //   - c.handleSessionPostSSHAuth
-//   - c.mayForwardLocalPortTo followed by ssh.DirectTCPIPHandler
+//   - c.mayForwardLocalPortTo followed by gliderssh.DirectTCPIPHandler
 type conn struct {
-	*ssh.Server
+	*gliderssh.Server
 	srv *server
 
 	insecureSkipTailscaleAuth bool // used by tests.
@@ -227,17 +239,29 @@ type conn struct {
 	idH    string
 	connID string // ID that's shared with control
 
-	// spac is a [gossh.ServerPreAuthConn] used for sending auth banners.
+	// spac is a [ssh.ServerPreAuthConn] used for sending auth banners.
 	// Banners cannot be sent after auth completes.
-	spac gossh.ServerPreAuthConn
+	spac ssh.ServerPreAuthConn
+
+	// The following fields are set during clientAuth and are used for policy
+	// evaluation and session management. They are immutable after clientAuth
+	// completes. They must not be read from other goroutines until
+	// authCompleted is set to true.
 
 	action0     *tailcfg.SSHAction // set by clientAuth
 	finalAction *tailcfg.SSHAction // set by clientAuth
 
-	info         *sshConnInfo // set by setInfo
+	info         *sshConnInfo // set by setInfo (during clientAuth)
 	localUser    *userMeta    // set by clientAuth
 	userGroupIDs []string     // set by clientAuth
 	acceptEnv    []string
+
+	// authCompleted is set to true after clientAuth has finished writing
+	// all authentication state fields (info, localUser, action0,
+	// finalAction, userGroupIDs, acceptEnv). It provides a memory
+	// barrier so that concurrent readers (e.g. OnPolicyChange) see
+	// fully-initialized values.
+	authCompleted atomic.Bool
 
 	// mu protects the following fields.
 	//
@@ -261,7 +285,7 @@ func (c *conn) vlogf(format string, args ...any) {
 
 // errDenied is returned by auth callbacks when a connection is denied by the
 // policy. It writes the message to an auth banner and then returns an empty
-// gossh.PartialSuccessError in order to stop processing authentication
+// ssh.PartialSuccessError in order to stop processing authentication
 // attempts and immediately disconnect the client.
 func (c *conn) errDenied(message string) error {
 	if message == "" {
@@ -274,14 +298,14 @@ func (c *conn) errDenied(message string) error {
 }
 
 // errBanner writes the given message to an auth banner and then returns an
-// empty gossh.PartialSuccessError in order to stop processing authentication
+// empty ssh.PartialSuccessError in order to stop processing authentication
 // attempts and immediately disconnect the client. The contents of err is not
 // leaked in the auth banner, but it is logged to the server's log.
 func (c *conn) errBanner(message string, err error) error {
 	if err != nil {
 		c.logf("%s: %s", message, err)
 	}
-	if err := c.spac.SendAuthBanner("tailscale: " + message); err != nil {
+	if err := c.spac.SendAuthBanner("tailscale: " + message + "\n"); err != nil {
 		c.logf("failed to send auth banner: %s", err)
 	}
 	return errTerminal
@@ -289,7 +313,7 @@ func (c *conn) errBanner(message string, err error) error {
 
 // errUnexpected is returned by auth callbacks that encounter an unexpected
 // error, such as being unable to send an auth banner. It sends an empty
-// gossh.PartialSuccessError to tell gossh.Server to stop processing
+// ssh.PartialSuccessError to tell ssh.Server to stop processing
 // authentication attempts and instead disconnect immediately.
 func (c *conn) errUnexpected(err error) error {
 	c.logf("terminal error: %s", err)
@@ -300,11 +324,11 @@ func (c *conn) errUnexpected(err error) error {
 //
 // If policy evaluation fails, it returns an error.
 // If access is denied, it returns an error. This must always be an empty
-// gossh.PartialSuccessError to prevent further authentication methods from
+// ssh.PartialSuccessError to prevent further authentication methods from
 // being tried.
-func (c *conn) clientAuth(cm gossh.ConnMetadata) (perms *gossh.Permissions, retErr error) {
+func (c *conn) clientAuth(cm ssh.ConnMetadata) (perms *ssh.Permissions, retErr error) {
 	defer func() {
-		if pse, ok := retErr.(*gossh.PartialSuccessError); ok {
+		if pse, ok := retErr.(*ssh.PartialSuccessError); ok {
 			if pse.Next.GSSAPIWithMICConfig != nil ||
 				pse.Next.KeyboardInteractiveCallback != nil ||
 				pse.Next.PasswordCallback != nil ||
@@ -317,16 +341,27 @@ func (c *conn) clientAuth(cm gossh.ConnMetadata) (perms *gossh.Permissions, retE
 	}()
 
 	if c.insecureSkipTailscaleAuth {
-		return &gossh.Permissions{}, nil
+		return &ssh.Permissions{}, nil
+	}
+
+	if uidRegex.MatchString(cm.User()) {
+		return nil, c.errBanner(fmt.Sprintf("rejecting username %q. Usernames that consist of only digits are not allowed as they are ambiguous with numerical UIDs", cm.User()), nil)
 	}
 
 	if err := c.setInfo(cm); err != nil {
 		return nil, c.errBanner("failed to get connection info", err)
 	}
 
-	action, localUser, acceptEnv, err := c.evaluatePolicy()
-	if err != nil {
-		return nil, c.errBanner("failed to evaluate SSH policy", err)
+	action, localUser, acceptEnv, result := c.evaluatePolicy()
+	switch result {
+	case accepted:
+		// do nothing
+	case rejectedUser:
+		return nil, c.errBanner(fmt.Sprintf("tailnet policy does not permit you to SSH as user %q", c.info.sshUser), nil)
+	case rejected, noPolicy:
+		return nil, c.errBanner("tailnet policy does not permit you to SSH to this node", fmt.Errorf("failed to evaluate policy, result: %s", result))
+	default:
+		return nil, c.errBanner("failed to evaluate tailnet policy", fmt.Errorf("failed to evaluate policy, result: %s", result))
 	}
 
 	c.action0 = action
@@ -357,7 +392,8 @@ func (c *conn) clientAuth(cm gossh.ConnMetadata) (perms *gossh.Permissions, retE
 				}
 			}
 			c.finalAction = action
-			return &gossh.Permissions{}, nil
+			c.authCompleted.Store(true)
+			return &ssh.Permissions{}, nil
 		case action.Reject:
 			metricTerminalReject.Add(1)
 			c.finalAction = action
@@ -390,14 +426,14 @@ func (c *conn) clientAuth(cm gossh.ConnMetadata) (perms *gossh.Permissions, retE
 	}
 }
 
-// ServerConfig implements ssh.ServerConfigCallback.
-func (c *conn) ServerConfig(ctx ssh.Context) *gossh.ServerConfig {
-	return &gossh.ServerConfig{
-		PreAuthConnCallback: func(spac gossh.ServerPreAuthConn) {
+// ServerConfig implements gliderssh.ServerConfigCallback.
+func (c *conn) ServerConfig(ctx gliderssh.Context) *ssh.ServerConfig {
+	return &ssh.ServerConfig{
+		PreAuthConnCallback: func(spac ssh.ServerPreAuthConn) {
 			c.spac = spac
 		},
 		NoClientAuth: true, // required for the NoClientAuthCallback to run
-		NoClientAuthCallback: func(cm gossh.ConnMetadata) (*gossh.Permissions, error) {
+		NoClientAuthCallback: func(cm ssh.ConnMetadata) (*ssh.Permissions, error) {
 			// First perform client authentication, which can potentially
 			// involve multiple steps (for example prompting user to log in to
 			// Tailscale admin panel to confirm identity).
@@ -411,10 +447,10 @@ func (c *conn) ServerConfig(ctx ssh.Context) *gossh.ServerConfig {
 			// specify a username ending in "+password" to force password auth.
 			// The actual value of the password doesn't matter.
 			if strings.HasSuffix(cm.User(), forcePasswordSuffix) {
-				return nil, &gossh.PartialSuccessError{
-					Next: gossh.ServerAuthCallbacks{
-						PasswordCallback: func(_ gossh.ConnMetadata, password []byte) (*gossh.Permissions, error) {
-							return &gossh.Permissions{}, nil
+				return nil, &ssh.PartialSuccessError{
+					Next: ssh.ServerAuthCallbacks{
+						PasswordCallback: func(_ ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
+							return &ssh.Permissions{}, nil
 						},
 					},
 				}
@@ -422,14 +458,14 @@ func (c *conn) ServerConfig(ctx ssh.Context) *gossh.ServerConfig {
 
 			return perms, nil
 		},
-		PasswordCallback: func(cm gossh.ConnMetadata, pword []byte) (*gossh.Permissions, error) {
+		PasswordCallback: func(cm ssh.ConnMetadata, pword []byte) (*ssh.Permissions, error) {
 			// Some clients don't request 'none' authentication. Instead, they
 			// immediately supply a password. We humor them by accepting the
 			// password, but authenticate as usual, ignoring the actual value of
 			// the password.
 			return c.clientAuth(cm)
 		},
-		PublicKeyCallback: func(cm gossh.ConnMetadata, key gossh.PublicKey) (*gossh.Permissions, error) {
+		PublicKeyCallback: func(cm ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 			// Some clients don't request 'none' authentication. Instead, they
 			// immediately supply a public key. We humor them by accepting the
 			// key, but authenticate as usual, ignoring the actual content of
@@ -451,40 +487,39 @@ func (srv *server) newConn() (*conn, error) {
 	srv.mu.Unlock()
 	c := &conn{srv: srv}
 	now := srv.now()
-	c.connID = fmt.Sprintf("ssh-conn-%s-%02x", now.UTC().Format("20060102T150405"), randBytes(5))
-	fwdHandler := &ssh.ForwardedTCPHandler{}
-	c.Server = &ssh.Server{
+	c.connID = fmt.Sprintf("ssh-conn-%s-%02x", now.UTC().Format(tstime.BasicDateTTime), randBytes(5))
+	fwdHandler := &gliderssh.ForwardedTCPHandler{}
+	streamLocalFwdHandler := &gliderssh.ForwardedUnixHandler{}
+	c.Server = &gliderssh.Server{
 		Version:              "Tailscale",
 		ServerConfigCallback: c.ServerConfig,
 
 		Handler:                       c.handleSessionPostSSHAuth,
 		LocalPortForwardingCallback:   c.mayForwardLocalPortTo,
 		ReversePortForwardingCallback: c.mayReversePortForwardTo,
-		SubsystemHandlers: map[string]ssh.SubsystemHandler{
+
+		LocalUnixForwardingCallback:   c.mayForwardLocalUnixTo,
+		ReverseUnixForwardingCallback: c.mayReverseUnixForwardTo,
+
+		SubsystemHandlers: map[string]gliderssh.SubsystemHandler{
 			"sftp": c.handleSessionPostSSHAuth,
 		},
-		// Note: the direct-tcpip channel handler and LocalPortForwardingCallback
-		// only adds support for forwarding ports from the local machine.
-		// TODO(maisem/bradfitz): add remote port forwarding support.
-		ChannelHandlers: map[string]ssh.ChannelHandler{
-			"direct-tcpip": ssh.DirectTCPIPHandler,
+		ChannelHandlers: map[string]gliderssh.ChannelHandler{
+			"direct-tcpip":                   gliderssh.DirectTCPIPHandler,
+			"direct-streamlocal@openssh.com": gliderssh.DirectStreamLocalHandler,
 		},
-		RequestHandlers: map[string]ssh.RequestHandler{
-			"tcpip-forward":        fwdHandler.HandleSSHRequest,
-			"cancel-tcpip-forward": fwdHandler.HandleSSHRequest,
+		RequestHandlers: map[string]gliderssh.RequestHandler{
+			"tcpip-forward":                          fwdHandler.HandleSSHRequest,
+			"cancel-tcpip-forward":                   fwdHandler.HandleSSHRequest,
+			"streamlocal-forward@openssh.com":        streamLocalFwdHandler.HandleSSHRequest,
+			"cancel-streamlocal-forward@openssh.com": streamLocalFwdHandler.HandleSSHRequest,
 		},
 	}
 	ss := c.Server
-	for k, v := range ssh.DefaultRequestHandlers {
-		ss.RequestHandlers[k] = v
-	}
-	for k, v := range ssh.DefaultChannelHandlers {
-		ss.ChannelHandlers[k] = v
-	}
-	for k, v := range ssh.DefaultSubsystemHandlers {
-		ss.SubsystemHandlers[k] = v
-	}
-	keys, err := srv.lb.GetSSH_HostKeys()
+	maps.Copy(ss.RequestHandlers, gliderssh.DefaultRequestHandlers)
+	maps.Copy(ss.ChannelHandlers, gliderssh.DefaultChannelHandlers)
+	maps.Copy(ss.SubsystemHandlers, gliderssh.DefaultSubsystemHandlers)
+	keys, err := getHostKeys(srv.lb.TailscaleVarRoot(), srv.logf)
 	if err != nil {
 		return nil, err
 	}
@@ -497,7 +532,7 @@ func (srv *server) newConn() (*conn, error) {
 // mayReversePortPortForwardTo reports whether the ctx should be allowed to port forward
 // to the specified host and port.
 // TODO(bradfitz/maisem): should we have more checks on host/port?
-func (c *conn) mayReversePortForwardTo(ctx ssh.Context, destinationHost string, destinationPort uint32) bool {
+func (c *conn) mayReversePortForwardTo(ctx gliderssh.Context, destinationHost string, destinationPort uint32) bool {
 	if sshDisableForwarding() {
 		return false
 	}
@@ -511,7 +546,7 @@ func (c *conn) mayReversePortForwardTo(ctx ssh.Context, destinationHost string, 
 // mayForwardLocalPortTo reports whether the ctx should be allowed to port forward
 // to the specified host and port.
 // TODO(bradfitz/maisem): should we have more checks on host/port?
-func (c *conn) mayForwardLocalPortTo(ctx ssh.Context, destinationHost string, destinationPort uint32) bool {
+func (c *conn) mayForwardLocalPortTo(ctx gliderssh.Context, destinationHost string, destinationPort uint32) bool {
 	if sshDisableForwarding() {
 		return false
 	}
@@ -522,6 +557,48 @@ func (c *conn) mayForwardLocalPortTo(ctx ssh.Context, destinationHost string, de
 	return false
 }
 
+// mayForwardLocalUnixTo is the server-side handler for
+// direct-streamlocal@openssh.com (SSH -L with Unix sockets). It returns a
+// connection to the specified Unix domain socket path if forwarding is
+// permitted, or an error if not.
+func (c *conn) mayForwardLocalUnixTo(ctx gliderssh.Context, socketPath string) (net.Conn, error) {
+	if sshDisableForwarding() {
+		return nil, gliderssh.ErrRejected
+	}
+	if c.finalAction != nil && c.finalAction.AllowLocalPortForwarding {
+		metricLocalPortForward.Add(1)
+		cb := gliderssh.NewLocalUnixForwardingCallback(c.unixForwardingOptions())
+		return cb(ctx, socketPath)
+	}
+	return nil, gliderssh.ErrRejected
+}
+
+// mayReverseUnixForwardTo is the server-side handler for
+// streamlocal-forward@openssh.com (SSH -R with Unix sockets). It returns a
+// listener for the specified Unix domain socket path if reverse forwarding is
+// permitted, or an error if not.
+func (c *conn) mayReverseUnixForwardTo(ctx gliderssh.Context, socketPath string) (net.Listener, error) {
+	if sshDisableForwarding() {
+		return nil, gliderssh.ErrRejected
+	}
+	if c.finalAction != nil && c.finalAction.AllowRemotePortForwarding {
+		metricRemotePortForward.Add(1)
+		cb := gliderssh.NewReverseUnixForwardingCallback(c.unixForwardingOptions())
+		return cb(ctx, socketPath)
+	}
+	return nil, gliderssh.ErrRejected
+}
+
+// unixForwardingOptions returns the Unix forwarding options scoped to the
+// authenticated local user. Socket paths are restricted to the user's home
+// directory, /tmp, and /run/user/<uid>.
+func (c *conn) unixForwardingOptions() gliderssh.UnixForwardingOptions {
+	return gliderssh.UnixForwardingOptions{
+		AllowedDirectories: gliderssh.UserSocketDirectories(c.localUser.HomeDir, c.localUser.Uid),
+		BindUnlink:         true,
+	}
+}
+
 // sshPolicy returns the SSHPolicy for current node.
 // If there is no SSHPolicy in the netmap, it returns a debugPolicy
 // if one is defined.
@@ -530,7 +607,7 @@ func (c *conn) sshPolicy() (_ *tailcfg.SSHPolicy, ok bool) {
 	if !lb.ShouldRunSSH() {
 		return nil, false
 	}
-	nm := lb.NetMap()
+	nm := lb.NetMapNoPeers()
 	if nm == nil {
 		return nil, false
 	}
@@ -569,7 +646,7 @@ func toIPPort(a net.Addr) (ipp netip.AddrPort) {
 
 // connInfo populates the sshConnInfo from the provided arguments,
 // validating only that they represent a known Tailscale identity.
-func (c *conn) setInfo(cm gossh.ConnMetadata) error {
+func (c *conn) setInfo(cm ssh.ConnMetadata) error {
 	if c.info != nil {
 		return nil
 	}
@@ -597,24 +674,29 @@ func (c *conn) setInfo(cm gossh.ConnMetadata) error {
 	return nil
 }
 
+type evalResult string
+
+const (
+	noPolicy     evalResult = "no policy"
+	rejected     evalResult = "rejected"
+	rejectedUser evalResult = "rejected user"
+	accepted     evalResult = "accept"
+)
+
 // evaluatePolicy returns the SSHAction and localUser after evaluating
 // the SSHPolicy for this conn.
-func (c *conn) evaluatePolicy() (_ *tailcfg.SSHAction, localUser string, acceptEnv []string, _ error) {
+func (c *conn) evaluatePolicy() (_ *tailcfg.SSHAction, localUser string, acceptEnv []string, result evalResult) {
 	pol, ok := c.sshPolicy()
 	if !ok {
-		return nil, "", nil, fmt.Errorf("tailssh: rejecting connection; no SSH policy")
+		return nil, "", nil, noPolicy
 	}
-	a, localUser, acceptEnv, ok := c.evalSSHPolicy(pol)
-	if !ok {
-		return nil, "", nil, fmt.Errorf("tailssh: rejecting connection; no matching policy")
-	}
-	return a, localUser, acceptEnv, nil
+	return c.evalSSHPolicy(pol)
 }
 
 // handleSessionPostSSHAuth runs an SSH session after the SSH-level authentication,
 // but not necessarily before all the Tailscale-level extra verification has
 // completed. It also handles SFTP requests.
-func (c *conn) handleSessionPostSSHAuth(s ssh.Session) {
+func (c *conn) handleSessionPostSSHAuth(s gliderssh.Session) {
 	// Do this check after auth, but before starting the session.
 	switch s.Subsystem() {
 	case "sftp":
@@ -635,11 +717,16 @@ func (c *conn) handleSessionPostSSHAuth(s ssh.Session) {
 	ss := c.newSSHSession(s)
 	ss.logf("handling new SSH connection from %v (%v) to ssh-user %q", c.info.uprof.LoginName, c.info.src.Addr(), c.localUser.Username)
 	ss.logf("access granted to %v as ssh-user %q", c.info.uprof.LoginName, c.localUser.Username)
+
+	if f, ok := hookSSHLoginSuccess.GetOk(); ok {
+		f(c.srv.logf, c)
+	}
+
 	ss.run()
 }
 
 func (c *conn) expandDelegateURLLocked(actionURL string) string {
-	nm := c.srv.lb.NetMap()
+	nm := c.srv.lb.NetMapNoPeers()
 	ci := c.info
 	lu := c.localUser
 	var dstNodeID string
@@ -658,7 +745,7 @@ func (c *conn) expandDelegateURLLocked(actionURL string) string {
 
 // sshSession is an accepted Tailscale SSH session.
 type sshSession struct {
-	ssh.Session
+	gliderssh.Session
 	sharedID string // ID that's shared with control
 	logf     logger.Logf
 
@@ -671,8 +758,8 @@ type sshSession struct {
 	cmd      *exec.Cmd
 	wrStdin  io.WriteCloser
 	rdStdout io.ReadCloser
-	rdStderr io.ReadCloser // rdStderr is nil for pty sessions
-	ptyReq   *ssh.Pty      // non-nil for pty sessions
+	rdStderr io.ReadCloser  // rdStderr is nil for pty sessions
+	ptyReq   *gliderssh.Pty // non-nil for pty sessions
 
 	// childPipes is a list of pipes that need to be closed when the process exits.
 	// For pty sessions, this is the tty fd.
@@ -682,6 +769,12 @@ type sshSession struct {
 	// We use this sync.Once to ensure that we only terminate the process once,
 	// either it exits itself or is terminated
 	exitOnce sync.Once
+
+	// exitHandled is closed when killProcessOnContextDone finishes writing any
+	// termination message to the client. run() waits on this before calling
+	// ss.Exit to ensure the message is flushed before the SSH channel is torn
+	// down. It is initialized by run() before starting killProcessOnContextDone.
+	exitHandled chan struct{}
 }
 
 func (ss *sshSession) vlogf(format string, args ...any) {
@@ -690,8 +783,8 @@ func (ss *sshSession) vlogf(format string, args ...any) {
 	}
 }
 
-func (c *conn) newSSHSession(s ssh.Session) *sshSession {
-	sharedID := fmt.Sprintf("sess-%s-%02x", c.srv.now().UTC().Format("20060102T150405"), randBytes(5))
+func (c *conn) newSSHSession(s gliderssh.Session) *sshSession {
+	sharedID := fmt.Sprintf("sess-%s-%02x", c.srv.now().UTC().Format(tstime.BasicDateTTime), randBytes(5))
 	c.logf("starting session: %v", sharedID)
 	ctx, cancel := context.WithCancelCause(s.Context())
 	return &sshSession{
@@ -706,9 +799,9 @@ func (c *conn) newSSHSession(s ssh.Session) *sshSession {
 
 // isStillValid reports whether the conn is still valid.
 func (c *conn) isStillValid() bool {
-	a, localUser, _, err := c.evaluatePolicy()
-	c.vlogf("stillValid: %+v %v %v", a, localUser, err)
-	if err != nil {
+	a, localUser, _, result := c.evaluatePolicy()
+	c.vlogf("stillValid: %+v %v %v", a, localUser, result)
+	if result != accepted {
 		return false
 	}
 	if !a.Accept && a.HoldAndDelegate == "" {
@@ -777,6 +870,7 @@ func (c *conn) fetchSSHAction(ctx context.Context, url string) (*tailcfg.SSHActi
 // killProcessOnContextDone waits for ss.ctx to be done and kills the process,
 // unless the process has already exited.
 func (ss *sshSession) killProcessOnContextDone() {
+	defer close(ss.exitHandled)
 	<-ss.ctx.Done()
 	// Either the process has already exited, in which case this does nothing.
 	// Or, the process is still running in which case this will kill it.
@@ -824,10 +918,10 @@ func (c *conn) detachSession(ss *sshSession) {
 var errSessionDone = errors.New("session is done")
 
 // handleSSHAgentForwarding starts a Unix socket listener and in the background
-// forwards agent connections between the listener and the ssh.Session.
+// forwards agent connections between the listener and the gliderssh.Session.
 // On success, it assigns ss.agentListener.
-func (ss *sshSession) handleSSHAgentForwarding(s ssh.Session, lu *userMeta) error {
-	if !ssh.AgentRequested(ss) || !ss.conn.finalAction.AllowAgentForwarding {
+func (ss *sshSession) handleSSHAgentForwarding(s gliderssh.Session, lu *userMeta) error {
+	if !gliderssh.AgentRequested(ss) || !ss.conn.finalAction.AllowAgentForwarding {
 		return nil
 	}
 	if sshDisableForwarding() {
@@ -837,7 +931,7 @@ func (ss *sshSession) handleSSHAgentForwarding(s ssh.Session, lu *userMeta) erro
 		return nil
 	}
 	ss.logf("ssh: agent forwarding requested")
-	ln, err := ssh.NewAgentListener()
+	ln, err := gliderssh.NewAgentListener()
 	if err != nil {
 		return err
 	}
@@ -869,7 +963,7 @@ func (ss *sshSession) handleSSHAgentForwarding(s ssh.Session, lu *userMeta) erro
 		return err
 	}
 
-	go ssh.ForwardAgentConnections(ln, s)
+	go gliderssh.ForwardAgentConnections(ln, s)
 	ss.agentListener = ln
 	return nil
 }
@@ -929,8 +1023,7 @@ func (ss *sshSession) run() {
 			var err error
 			rec, err = ss.startNewRecording()
 			if err != nil {
-				var uve userVisibleError
-				if errors.As(err, &uve) {
+				if uve, ok := errors.AsType[userVisibleError](err); ok {
 					fmt.Fprintf(ss, "%s\r\n", uve.SSHTerminationMessage())
 				} else {
 					fmt.Fprintf(ss, "can't start new recording\r\n")
@@ -950,15 +1043,17 @@ func (ss *sshSession) run() {
 	if err != nil {
 		logf("start failed: %v", err.Error())
 		if errors.Is(err, context.Canceled) {
-			err := context.Cause(ss.ctx)
-			var uve userVisibleError
-			if errors.As(err, &uve) {
-				fmt.Fprintf(ss, "%s\r\n", uve)
+			cause := context.Cause(ss.ctx)
+			if serr, ok := cause.(SSHTerminationError); ok {
+				if msg := serr.SSHTerminationMessage(); msg != "" {
+					io.WriteString(ss.Stderr(), "\r\n\r\n"+msg+"\r\n\r\n")
+				}
 			}
 		}
 		ss.Exit(1)
 		return
 	}
+	ss.exitHandled = make(chan struct{})
 	go ss.killProcessOnContextDone()
 
 	var processDone atomic.Bool
@@ -1009,6 +1104,15 @@ func (ss *sshSession) run() {
 	err = ss.cmd.Wait()
 	processDone.Store(true)
 
+	if ss.ctx.Err() != nil {
+		// Context was canceled (e.g., recording upload failure).
+		// Wait for killProcessOnContextDone to finish writing any
+		// termination message before we proceed. This must happen
+		// before closeAll and CloseWrite so the SSH channel is
+		// still writable.
+		<-ss.exitHandled
+	}
+
 	// This will either make the SSH Termination goroutine be a no-op,
 	// or itself will be a no-op because the process was killed by the
 	// aforementioned goroutine.
@@ -1021,6 +1125,7 @@ func (ss *sshSession) run() {
 	select {
 	case <-outputDone:
 	case <-ss.ctx.Done():
+		<-ss.exitHandled
 	}
 
 	if err == nil {
@@ -1089,13 +1194,20 @@ func (c *conn) ruleExpired(r *tailcfg.SSHRule) bool {
 	return r.RuleExpires.Before(c.srv.now())
 }
 
-func (c *conn) evalSSHPolicy(pol *tailcfg.SSHPolicy) (a *tailcfg.SSHAction, localUser string, acceptEnv []string, ok bool) {
+func (c *conn) evalSSHPolicy(pol *tailcfg.SSHPolicy) (a *tailcfg.SSHAction, localUser string, acceptEnv []string, result evalResult) {
+	failedOnUser := false
 	for _, r := range pol.Rules {
 		if a, localUser, acceptEnv, err := c.matchRule(r); err == nil {
-			return a, localUser, acceptEnv, true
+			return a, localUser, acceptEnv, accepted
+		} else if errors.Is(err, errUserMatch) {
+			failedOnUser = true
 		}
 	}
-	return nil, "", nil, false
+	result = rejected
+	if failedOnUser {
+		result = rejectedUser
+	}
+	return nil, "", nil, result
 }
 
 // internal errors for testing; they don't escape to callers or logs.
@@ -1129,6 +1241,9 @@ func (c *conn) matchRule(r *tailcfg.SSHRule) (a *tailcfg.SSHAction, localUser st
 	if c.ruleExpired(r) {
 		return nil, "", nil, errRuleExpired
 	}
+	if !c.anyPrincipalMatches(r.Principals) {
+		return nil, "", nil, errPrincipalMatch
+	}
 	if !r.Action.Reject {
 		// For all but Reject rules, SSHUsers is required.
 		// If SSHUsers is nil or empty, mapLocalUser will return an
@@ -1137,9 +1252,6 @@ func (c *conn) matchRule(r *tailcfg.SSHRule) (a *tailcfg.SSHAction, localUser st
 		if localUser == "" {
 			return nil, "", nil, errUserMatch
 		}
-	}
-	if !c.anyPrincipalMatches(r.Principals) {
-		return nil, "", nil, errPrincipalMatch
 	}
 	return r.Action, localUser, r.AcceptEnv, nil
 }
@@ -1232,7 +1344,7 @@ func (ss *sshSession) startNewRecording() (_ *recording, err error) {
 		}
 	}
 
-	var w ssh.Window
+	var w gliderssh.Window
 	if ptyReq, _, isPtyReq := ss.Pty(); isPtyReq {
 		w = ptyReq.Window
 	}

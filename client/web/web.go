@@ -1,12 +1,12 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package web provides the Tailscale client for web.
 package web
 
 import (
+	"cmp"
 	"context"
-	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,19 +14,20 @@ import (
 	"log"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"os"
 	"path"
-	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/gorilla/csrf"
 	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/apitype"
-	"tailscale.com/clientupdate"
 	"tailscale.com/envknob"
 	"tailscale.com/envknob/featureknob"
+	"tailscale.com/feature"
+	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
@@ -34,9 +35,12 @@ import (
 	"tailscale.com/net/netutil"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tsweb"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/views"
+	"tailscale.com/util/ctxkey"
 	"tailscale.com/util/httpm"
+	"tailscale.com/util/syspolicy/policyclient"
 	"tailscale.com/version"
 	"tailscale.com/version/distro"
 )
@@ -50,6 +54,7 @@ type Server struct {
 	mode ServerMode
 
 	logf    logger.Logf
+	polc    policyclient.Client // must be non-nil
 	lc      *local.Client
 	timeNow func() time.Time
 
@@ -59,6 +64,12 @@ type Server struct {
 	devMode    bool
 	cgiMode    bool
 	pathPrefix string
+
+	// originOverride is the origin that the web UI is accessible from.
+	// This value is used in the fallback CSRF checks when Sec-Fetch-Site is not
+	// available. In this case the application will compare Host and Origin
+	// header values to determine if the request is from the same origin.
+	originOverride string
 
 	apiHandler    http.Handler // serves api endpoints; csrf-protected
 	assetsHandler http.Handler // serves frontend assets
@@ -134,8 +145,12 @@ type ServerOpts struct {
 	TimeNow func() time.Time
 
 	// Logf optionally provides a logger function.
-	// log.Printf is used as default.
+	// If nil, log.Printf is used as default.
 	Logf logger.Logf
+
+	// PolicyClient, if non-nil, will be used to fetch policy settings.
+	// If nil, the default policy client will be used.
+	PolicyClient policyclient.Client
 
 	// The following two fields are required and used exclusively
 	// in ManageServerMode to facilitate the control server login
@@ -150,6 +165,9 @@ type ServerOpts struct {
 	// as completed.
 	// This field is required for ManageServerMode mode.
 	WaitAuthURL func(ctx context.Context, id string, src tailcfg.NodeID) (*tailcfg.WebClientAuthResponse, error)
+
+	// OriginOverride specifies the origin that the web UI will be accessible from if hosted behind a reverse proxy or CGI.
+	OriginOverride string
 }
 
 // NewServer constructs a new Tailscale web client server.
@@ -169,15 +187,17 @@ func NewServer(opts ServerOpts) (s *Server, err error) {
 		opts.LocalClient = &local.Client{}
 	}
 	s = &Server{
-		mode:        opts.Mode,
-		logf:        opts.Logf,
-		devMode:     envknob.Bool("TS_DEBUG_WEB_CLIENT_DEV"),
-		lc:          opts.LocalClient,
-		cgiMode:     opts.CGIMode,
-		pathPrefix:  opts.PathPrefix,
-		timeNow:     opts.TimeNow,
-		newAuthURL:  opts.NewAuthURL,
-		waitAuthURL: opts.WaitAuthURL,
+		mode:           opts.Mode,
+		polc:           cmp.Or(opts.PolicyClient, policyclient.Get()),
+		logf:           opts.Logf,
+		devMode:        envknob.Bool("TS_DEBUG_WEB_CLIENT_DEV"),
+		lc:             opts.LocalClient,
+		cgiMode:        opts.CGIMode,
+		pathPrefix:     opts.PathPrefix,
+		timeNow:        opts.TimeNow,
+		newAuthURL:     opts.NewAuthURL,
+		waitAuthURL:    opts.WaitAuthURL,
+		originOverride: opts.OriginOverride,
 	}
 	if opts.PathPrefix != "" {
 		// Enforce that path prefix always has a single leading '/'
@@ -205,7 +225,7 @@ func NewServer(opts ServerOpts) (s *Server, err error) {
 
 	var metric string
 	s.apiHandler, metric = s.modeAPIHandler(s.mode)
-	s.apiHandler = s.withCSRF(s.apiHandler)
+	s.apiHandler = s.csrfProtect(s.apiHandler)
 
 	// Don't block startup on reporting metric.
 	// Report in separate go routine with 5 second timeout.
@@ -218,23 +238,64 @@ func NewServer(opts ServerOpts) (s *Server, err error) {
 	return s, nil
 }
 
-func (s *Server) withCSRF(h http.Handler) http.Handler {
-	csrfProtect := csrf.Protect(s.csrfKey(), csrf.Secure(false))
-
-	// ref https://github.com/tailscale/tailscale/pull/14822
-	// signal to the CSRF middleware that the request is being served over
-	// plaintext HTTP to skip TLS-only header checks.
-	withSetPlaintext := func(h http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			r = csrf.PlaintextHTTPRequest(r)
+func (s *Server) csrfProtect(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// CSRF is not required for GET, HEAD, or OPTIONS requests.
+		if slices.Contains([]string{"GET", "HEAD", "OPTIONS"}, r.Method) {
 			h.ServeHTTP(w, r)
-		})
-	}
+			return
+		}
 
-	// NB: the order of the withSetPlaintext and csrfProtect calls is important
-	// to ensure that we signal to the CSRF middleware that the request is being
-	// served over plaintext HTTP and not over TLS as it presumes by default.
-	return withSetPlaintext(csrfProtect(h))
+		// first attempt to use Sec-Fetch-Site header (sent by all modern
+		// browsers to "potentially trustworthy" origins i.e. localhost or those
+		// served over HTTPS)
+		secFetchSite := r.Header.Get("Sec-Fetch-Site")
+		if secFetchSite == "same-origin" {
+			h.ServeHTTP(w, r)
+			return
+		} else if secFetchSite != "" {
+			http.Error(w, fmt.Sprintf("CSRF request denied with Sec-Fetch-Site %q", secFetchSite), http.StatusForbidden)
+			return
+		}
+
+		// if Sec-Fetch-Site is not available we presume we are operating over HTTP.
+		// We fall back to comparing the Origin & Host headers.
+
+		// use the Host header to determine the expected origin
+		// (use the override if set to allow for reverse proxying)
+		host := r.Host
+		if host == "" {
+			http.Error(w, "CSRF request denied with no Host header", http.StatusForbidden)
+			return
+		}
+		if s.originOverride != "" {
+			host = s.originOverride
+		}
+
+		originHeader := r.Header.Get("Origin")
+		if originHeader == "" {
+			http.Error(w, "CSRF request denied with no Origin header", http.StatusForbidden)
+			return
+		}
+		parsedOrigin, err := url.Parse(originHeader)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("CSRF request denied with invalid Origin %q", r.Header.Get("Origin")), http.StatusForbidden)
+			return
+		}
+		origin := parsedOrigin.Host
+		if origin == "" {
+			http.Error(w, "CSRF request denied with no host in the Origin header", http.StatusForbidden)
+			return
+		}
+
+		if origin != host {
+			http.Error(w, fmt.Sprintf("CSRF request denied with mismatched Origin %q and Host %q", origin, host), http.StatusForbidden)
+			return
+		}
+
+		h.ServeHTTP(w, r)
+
+	})
 }
 
 func (s *Server) modeAPIHandler(mode ServerMode) (http.Handler, string) {
@@ -438,6 +499,10 @@ func (s *Server) authorizeRequest(w http.ResponseWriter, r *http.Request) (ok bo
 	// Client using system-specific auth.
 	switch distro.Get() {
 	case distro.Synology:
+		if !buildfeatures.HasSynology {
+			// Synology support not built in.
+			return false
+		}
 		authorized, _ := authorizeSynology(r)
 		return authorized
 	case distro.QNAP:
@@ -452,7 +517,6 @@ func (s *Server) authorizeRequest(w http.ResponseWriter, r *http.Request) (ok bo
 // It should only be called by Server.ServeHTTP, via Server.apiHandler,
 // which protects the handler using gorilla csrf.
 func (s *Server) serveLoginAPI(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("X-CSRF-Token", csrf.Token(r))
 	switch {
 	case r.URL.Path == "/api/data" && r.Method == httpm.GET:
 		s.serveGetNodeData(w, r)
@@ -465,45 +529,40 @@ func (s *Server) serveLoginAPI(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-type apiHandler[data any] struct {
-	s *Server
-	w http.ResponseWriter
-	r *http.Request
-
-	// permissionCheck allows for defining whether a requesting peer's
-	// capabilities grant them access to make the given data update.
-	// If permissionCheck reports false, the request fails as unauthorized.
-	permissionCheck func(data data, peer peerCapabilities) bool
-}
-
-// newHandler constructs a new api handler which restricts the given request
-// to the specified permission check. If the permission check fails for
-// the peer associated with the request, an unauthorized error is returned
-// to the client.
-func newHandler[data any](s *Server, w http.ResponseWriter, r *http.Request, permissionCheck func(data data, peer peerCapabilities) bool) *apiHandler[data] {
-	return &apiHandler[data]{
-		s:               s,
-		w:               w,
-		r:               r,
-		permissionCheck: permissionCheck,
+// handleJSON manages decoding the request's body JSON as data and passing it
+// on to the provided handler function.
+func handleJSON[data any](h func(ctx context.Context, data data) error) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var body data
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if err := h(r.Context(), body); err != nil {
+			if httpErr, ok := errors.AsType[tsweb.HTTPError](err); ok {
+				tsweb.WriteHTTPError(w, r, httpErr)
+			} else {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+			}
+			return
+		}
+		w.WriteHeader(http.StatusOK)
 	}
 }
 
-// alwaysAllowed can be passed as the permissionCheck argument to newHandler
-// for requests that are always allowed to complete regardless of a peer's
-// capabilities.
-func alwaysAllowed[data any](_ data, _ peerCapabilities) bool { return true }
+var contextKeyPeer = ctxkey.New("peer-capabilities", peerCapabilities{})
 
-func (a *apiHandler[data]) getPeer() (peerCapabilities, error) {
+func (s *Server) setPeer(r *http.Request) (*http.Request, error) {
 	// TODO(tailscale/corp#16695,sonia): We also call StatusWithoutPeers and
 	// WhoIs when originally checking for a session from authorizeRequest.
 	// Would be nice if we could pipe those through to here so we don't end
 	// up having to re-call them to grab the peer capabilities.
-	status, err := a.s.lc.StatusWithoutPeers(a.r.Context())
+	status, err := s.lc.StatusWithoutPeers(r.Context())
 	if err != nil {
 		return nil, err
 	}
-	whois, err := a.s.lc.WhoIs(a.r.Context(), a.r.RemoteAddr)
+	whois, err := s.lc.WhoIs(r.Context(), r.RemoteAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -511,56 +570,11 @@ func (a *apiHandler[data]) getPeer() (peerCapabilities, error) {
 	if err != nil {
 		return nil, err
 	}
-	return peer, nil
+	return r.WithContext(contextKeyPeer.WithValue(r.Context(), peer)), nil
 }
 
-type noBodyData any // empty type, for use from serveAPI for endpoints with empty body
-
-// handle runs the given handler if the source peer satisfies the
-// constraints for running this request.
-//
-// handle is expected for use when `data` type is empty, or set to
-// `noBodyData` in practice. For requests that expect JSON body data
-// to be attached, use handleJSON instead.
-func (a *apiHandler[data]) handle(h http.HandlerFunc) {
-	peer, err := a.getPeer()
-	if err != nil {
-		http.Error(a.w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	var body data // not used
-	if !a.permissionCheck(body, peer) {
-		http.Error(a.w, "not allowed", http.StatusUnauthorized)
-		return
-	}
-	h(a.w, a.r)
-}
-
-// handleJSON manages decoding the request's body JSON and passing
-// it on to the provided function if the source peer satisfies the
-// constraints for running this request.
-func (a *apiHandler[data]) handleJSON(h func(ctx context.Context, data data) error) {
-	defer a.r.Body.Close()
-	var body data
-	if err := json.NewDecoder(a.r.Body).Decode(&body); err != nil {
-		http.Error(a.w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	peer, err := a.getPeer()
-	if err != nil {
-		http.Error(a.w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if !a.permissionCheck(body, peer) {
-		http.Error(a.w, "not allowed", http.StatusUnauthorized)
-		return
-	}
-
-	if err := h(a.r.Context(), body); err != nil {
-		http.Error(a.w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	a.w.WriteHeader(http.StatusOK)
+func (s *Server) getPeer(ctx context.Context) peerCapabilities {
+	return contextKeyPeer.Value(ctx)
 }
 
 // serveAPI serves requests for the web client api.
@@ -575,68 +589,44 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	w.Header().Set("X-CSRF-Token", csrf.Token(r))
+	var err error
+	r, err = s.setPeer(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
 	path := strings.TrimPrefix(r.URL.Path, "/api")
 	switch {
 	case path == "/data" && r.Method == httpm.GET:
-		newHandler[noBodyData](s, w, r, alwaysAllowed).
-			handle(s.serveGetNodeData)
+		s.serveGetNodeData(w, r)
 		return
 	case path == "/exit-nodes" && r.Method == httpm.GET:
-		newHandler[noBodyData](s, w, r, alwaysAllowed).
-			handle(s.serveGetExitNodes)
+		s.serveGetExitNodes(w, r)
 		return
 	case path == "/routes" && r.Method == httpm.POST:
-		peerAllowed := func(d postRoutesRequest, p peerCapabilities) bool {
-			if d.SetExitNode && !p.canEdit(capFeatureExitNodes) {
-				return false
-			} else if d.SetRoutes && !p.canEdit(capFeatureSubnets) {
-				return false
-			}
-			return true
-		}
-		newHandler[postRoutesRequest](s, w, r, peerAllowed).
-			handleJSON(s.servePostRoutes)
+		handleJSON[postRoutesRequest](s.servePostRoutes)(w, r)
 		return
 	case path == "/device-details-click" && r.Method == httpm.POST:
-		newHandler[noBodyData](s, w, r, alwaysAllowed).
-			handle(s.serveDeviceDetailsClick)
+		s.serveDeviceDetailsClick(w, r)
 		return
 	case path == "/local/v0/logout" && r.Method == httpm.POST:
-		peerAllowed := func(_ noBodyData, peer peerCapabilities) bool {
-			return peer.canEdit(capFeatureAccount)
-		}
-		newHandler[noBodyData](s, w, r, peerAllowed).
-			handle(s.proxyRequestToLocalAPI)
+		s.proxyRequestToLocalAPI(w, r)
 		return
 	case path == "/local/v0/prefs" && r.Method == httpm.PATCH:
-		peerAllowed := func(data maskedPrefs, peer peerCapabilities) bool {
-			if data.RunSSHSet && !peer.canEdit(capFeatureSSH) {
-				return false
-			}
-			return true
-		}
-		newHandler[maskedPrefs](s, w, r, peerAllowed).
-			handleJSON(s.serveUpdatePrefs)
+		handleJSON[maskedPrefs](s.serveUpdatePrefs)(w, r)
 		return
 	case path == "/local/v0/update/check" && r.Method == httpm.GET:
-		newHandler[noBodyData](s, w, r, alwaysAllowed).
-			handle(s.proxyRequestToLocalAPI)
+		s.proxyRequestToLocalAPI(w, r)
 		return
 	case path == "/local/v0/update/check" && r.Method == httpm.POST:
-		peerAllowed := func(_ noBodyData, peer peerCapabilities) bool {
-			return peer.canEdit(capFeatureAccount)
-		}
-		newHandler[noBodyData](s, w, r, peerAllowed).
-			handle(s.proxyRequestToLocalAPI)
+		s.proxyRequestToLocalAPI(w, r)
 		return
 	case path == "/local/v0/update/progress" && r.Method == httpm.POST:
-		newHandler[noBodyData](s, w, r, alwaysAllowed).
-			handle(s.proxyRequestToLocalAPI)
+		s.proxyRequestToLocalAPI(w, r)
 		return
 	case path == "/local/v0/upload-client-metrics" && r.Method == httpm.POST:
-		newHandler[noBodyData](s, w, r, alwaysAllowed).
-			handle(s.proxyRequestToLocalAPI)
+		s.proxyRequestToLocalAPI(w, r)
 		return
 	}
 	http.Error(w, "invalid endpoint", http.StatusNotFound)
@@ -707,6 +697,19 @@ func (s *Server) serveAPIAuth(w http.ResponseWriter, r *http.Request) {
 			}
 		default:
 			// no additional auth for this distro
+		}
+	}
+
+	// We might have a session for which we haven't awaited the result yet.
+	// This can happen when the AuthURL opens in the same browser tab instead
+	// of a new one due to browser settings.
+	// (See https://github.com/tailscale/tailscale/issues/11905)
+	// We therefore set a PendingAuth flag when creating a new session, check
+	// it here and call awaitUserAuth if we find it to be true. Once the auth
+	// wait completes, awaitUserAuth will set PendingAuth to false.
+	if sErr == nil && session.PendingAuth == true {
+		if err := s.awaitUserAuth(r.Context(), session); err != nil {
+			sErr = err
 		}
 	}
 
@@ -902,7 +905,7 @@ func (s *Server) serveGetNodeData(w http.ResponseWriter, r *http.Request) {
 		UnraidToken:      os.Getenv("UNRAID_CSRF_TOKEN"),
 		RunningSSHServer: prefs.RunSSH,
 		URLPrefix:        strings.TrimSuffix(s.pathPrefix, "/"),
-		ControlAdminURL:  prefs.AdminPageURL(),
+		ControlAdminURL:  prefs.AdminPageURL(s.polc),
 		LicensesURL:      licenses.LicensesURL(),
 		Features:         availableFeatures(),
 
@@ -922,9 +925,18 @@ func (s *Server) serveGetNodeData(w http.ResponseWriter, r *http.Request) {
 		data.ClientVersion = cv
 	}
 
-	if st.CurrentTailnet != nil {
-		data.TailnetName = st.CurrentTailnet.MagicDNSSuffix
-		data.DomainName = st.CurrentTailnet.Name
+	profile, _, err := s.lc.ProfileStatus(r.Context())
+	if err != nil {
+		s.logf("error fetching profiles: %v", err)
+		// If for some reason we can't fetch profiles,
+		// continue to use st.CurrentTailnet if set.
+		if st.CurrentTailnet != nil {
+			data.TailnetName = st.CurrentTailnet.MagicDNSSuffix
+			data.DomainName = st.CurrentTailnet.Name
+		}
+	} else {
+		data.TailnetName = profile.NetworkProfile.MagicDNSName
+		data.DomainName = profile.NetworkProfile.DisplayNameOrDefault()
 	}
 	if st.Self.Tags != nil {
 		data.Tags = st.Self.Tags.AsSlice()
@@ -984,7 +996,7 @@ func availableFeatures() map[string]bool {
 		"advertise-routes":    true, // available on all platforms
 		"use-exit-node":       featureknob.CanUseExitNode() == nil,
 		"ssh":                 featureknob.CanRunTailscaleSSH() == nil,
-		"auto-update":         version.IsUnstableBuild() && clientupdate.CanAutoUpdate(),
+		"auto-update":         version.IsUnstableBuild() && feature.CanAutoUpdate(),
 	}
 	return features
 }
@@ -1039,6 +1051,11 @@ type maskedPrefs struct {
 }
 
 func (s *Server) serveUpdatePrefs(ctx context.Context, prefs maskedPrefs) error {
+	peer := s.getPeer(ctx)
+	if prefs.RunSSHSet && !peer.canEdit(capFeatureSSH) {
+		return tsweb.Error(http.StatusUnauthorized, "RunSSHSet not allowed", nil)
+	}
+
 	_, err := s.lc.EditPrefs(ctx, &ipn.MaskedPrefs{
 		RunSSHSet: prefs.RunSSHSet,
 		Prefs: ipn.Prefs{
@@ -1057,6 +1074,17 @@ type postRoutesRequest struct {
 }
 
 func (s *Server) servePostRoutes(ctx context.Context, data postRoutesRequest) error {
+	if !data.SetExitNode && !data.SetRoutes {
+		return tsweb.Error(http.StatusBadRequest, "must specify SetExitNode or SetRoutes", nil)
+	}
+	peer := s.getPeer(ctx)
+	if data.SetExitNode && !peer.canEdit(capFeatureExitNodes) {
+		return tsweb.Error(http.StatusUnauthorized, "SetExitNode not allowed", nil)
+	}
+	if data.SetRoutes && !peer.canEdit(capFeatureSubnets) {
+		return tsweb.Error(http.StatusUnauthorized, "SetRoutes not allowed", nil)
+	}
+
 	prefs, err := s.lc.GetPrefs(ctx)
 	if err != nil {
 		return err
@@ -1070,12 +1098,13 @@ func (s *Server) servePostRoutes(ctx context.Context, data postRoutesRequest) er
 		}
 		currNonExitRoutes = append(currNonExitRoutes, r.String())
 	}
-	// Set non-edited fields to their current values.
-	if data.SetExitNode {
-		data.AdvertiseRoutes = currNonExitRoutes
-	} else if data.SetRoutes {
+	// For each group of fields not being set, preserve the current prefs.
+	if !data.SetExitNode {
 		data.AdvertiseExitNode = currAdvertisingExitNode
 		data.UseExitNode = prefs.ExitNodeID
+	}
+	if !data.SetRoutes {
+		data.AdvertiseRoutes = currNonExitRoutes
 	}
 
 	// Calculate routes.
@@ -1253,6 +1282,19 @@ func (s *Server) proxyRequestToLocalAPI(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	switch path {
+	case "/v0/logout":
+		if !s.getPeer(r.Context()).canEdit(capFeatureAccount) {
+			http.Error(w, "not allowed", http.StatusUnauthorized)
+			return
+		}
+	case "/v0/update/check":
+		if r.Method == httpm.POST && !s.getPeer(r.Context()).canEdit(capFeatureAccount) {
+			http.Error(w, "not allowed", http.StatusUnauthorized)
+			return
+		}
+	}
+
 	localAPIURL := "http://" + apitype.LocalAPIHost + "/localapi" + path
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, localAPIURL, r.Body)
 	if err != nil {
@@ -1274,37 +1316,6 @@ func (s *Server) proxyRequestToLocalAPI(w http.ResponseWriter, r *http.Request) 
 	if _, err := io.Copy(w, resp.Body); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
-}
-
-// csrfKey returns a key that can be used for CSRF protection.
-// If an error occurs during key creation, the error is logged and the active process terminated.
-// If the server is running in CGI mode, the key is cached to disk and reused between requests.
-// If an error occurs during key storage, the error is logged and the active process terminated.
-func (s *Server) csrfKey() []byte {
-	csrfFile := filepath.Join(os.TempDir(), "tailscale-web-csrf.key")
-
-	// if running in CGI mode, try to read from disk, but ignore errors
-	if s.cgiMode {
-		key, _ := os.ReadFile(csrfFile)
-		if len(key) == 32 {
-			return key
-		}
-	}
-
-	// create a new key
-	key := make([]byte, 32)
-	if _, err := rand.Read(key); err != nil {
-		log.Fatalf("error generating CSRF key: %v", err)
-	}
-
-	// if running in CGI mode, try to write the newly created key to disk, and exit if it fails.
-	if s.cgiMode {
-		if err := os.WriteFile(csrfFile, key, 0600); err != nil {
-			log.Fatalf("unable to store CSRF key: %v", err)
-		}
-	}
-
-	return key
 }
 
 // enforcePrefix returns a HandlerFunc that enforces a given path prefix is used in requests,

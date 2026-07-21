@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package taildrop
@@ -16,6 +16,12 @@ import (
 // This must be called before Tailscale is started.
 func (e *Extension) SetDirectFileRoot(root string) {
 	e.directFileRoot = root
+}
+
+// SetFileOps sets the platform specific file operations. This is used
+// to call Android's Storage Access Framework APIs.
+func (e *Extension) SetFileOps(fileOps FileOps) {
+	e.fileOps = fileOps
 }
 
 func (e *Extension) setPlatformDefaultDirectFileRoot() {

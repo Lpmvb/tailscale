@@ -1,5 +1,7 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
+
+//go:build !ts_omit_debug
 
 package wgengine
 
@@ -19,6 +21,8 @@ import (
 	"tailscale.com/util/mak"
 	"tailscale.com/wgengine/filter"
 )
+
+type flowtrackTuple = flowtrack.Tuple
 
 const tcpTimeoutBeforeDebug = 5 * time.Second
 
@@ -56,19 +60,30 @@ func (e *userspaceEngine) noteFlowProblemFromPeer(f flowtrack.Tuple, problem pac
 	of.problem = problem
 }
 
+func tsRejectFlow(rh packet.TailscaleRejectedHeader) flowtrack.Tuple {
+	return flowtrack.MakeTuple(rh.Proto, rh.Src, rh.Dst)
+}
+
 func (e *userspaceEngine) trackOpenPreFilterIn(pp *packet.Parsed, t *tstun.Wrapper) (res filter.Response) {
 	res = filter.Accept // always
 
 	if pp.IPProto == ipproto.TSMP {
-		res = filter.DropSilently
 		rh, ok := pp.AsTailscaleRejectedHeader()
 		if !ok {
 			return
 		}
 		if rh.MaybeBroken {
-			e.noteFlowProblemFromPeer(rh.Flow(), rh.Reason)
-		} else if f := rh.Flow(); e.removeFlow(f) {
+			e.noteFlowProblemFromPeer(tsRejectFlow(rh), rh.Reason)
+		} else if f := tsRejectFlow(rh); e.removeFlow(f) {
 			e.logf("open-conn-track: flow %v %v > %v rejected due to %v", rh.Proto, rh.Src, rh.Dst, rh.Reason)
+		}
+		switch rh.Reason {
+		case packet.RejectedDueToUnknownAppConnectorTransitIP:
+			// Keep res = filter.Accept, don't drop this packet because it will
+			// be used later for further communication between app connector
+			// and client.
+		default:
+			res = filter.DropSilently
 		}
 		return
 	}
@@ -93,8 +108,8 @@ var (
 	appleIPRange = netip.MustParsePrefix("17.0.0.0/8")
 	canonicalIPs = sync.OnceValue(func() (checkIPFunc func(netip.Addr) bool) {
 		// https://bgp.he.net/AS41231#_prefixes
-		t := &bart.Table[bool]{}
-		for _, s := range strings.Fields(`
+		t := &bart.Lite{}
+		for s := range strings.FieldsSeq(`
 			91.189.89.0/24
 			91.189.91.0/24
 			91.189.92.0/24
@@ -107,12 +122,9 @@ var (
 			185.125.188.0/23
 			185.125.190.0/24
 			194.169.254.0/24`) {
-			t.Insert(netip.MustParsePrefix(s), true)
+			t.Insert(netip.MustParsePrefix(s))
 		}
-		return func(ip netip.Addr) bool {
-			v, _ := t.Lookup(ip)
-			return v
-		}
+		return t.Contains
 	})
 )
 
@@ -126,14 +138,14 @@ func (e *userspaceEngine) isOSNetworkProbe(dst netip.AddrPort) bool {
 	// iOS had log spam like:
 	// open-conn-track: timeout opening (100.115.73.60:52501 => 17.125.252.5:443); no associated peer node
 	if runtime.GOOS == "ios" && dst.Port() == 443 && appleIPRange.Contains(dst.Addr()) {
-		if _, ok := e.PeerForIP(dst.Addr()); !ok {
+		if _, ok := e.peerForIP(dst.Addr()); !ok {
 			return true
 		}
 	}
 	// NetworkManager; https://github.com/tailscale/tailscale/issues/13687
 	// open-conn-track: timeout opening (TCP 100.96.229.119:42798 => 185.125.190.49:80); no associated peer node
 	if runtime.GOOS == "linux" && dst.Port() == 80 && canonicalIPs()(dst.Addr()) {
-		if _, ok := e.PeerForIP(dst.Addr()); !ok {
+		if _, ok := e.peerForIP(dst.Addr()); !ok {
 			return true
 		}
 	}
@@ -187,7 +199,7 @@ func (e *userspaceEngine) onOpenTimeout(flow flowtrack.Tuple) {
 	}
 
 	// Diagnose why it might've timed out.
-	pip, ok := e.PeerForIP(flow.DstAddr())
+	pip, ok := e.peerForIP(flow.DstAddr())
 	if !ok {
 		e.logf("open-conn-track: timeout opening %v; no associated peer node", flow)
 		return

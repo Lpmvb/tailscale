@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // This file contains the plan9-specific version of the incubator. Tailscaled
@@ -92,7 +92,7 @@ func (ss *sshSession) newIncubatorCommand(logf logger.Logf) (cmd *exec.Cmd, err 
 		"--tty-name=",     // updated in-place by startWithPTY
 	}
 
-	nm := ss.conn.srv.lb.NetMap()
+	nm := ss.conn.srv.lb.NetMapNoPeers()
 	forceV1Behavior := nm.HasCap(tailcfg.NodeAttrSSHBehaviorV1) && !nm.HasCap(tailcfg.NodeAttrSSHBehaviorV2)
 	if forceV1Behavior {
 		incubatorArgs = append(incubatorArgs, "--force-v1-behavior")

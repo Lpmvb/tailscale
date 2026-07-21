@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package tstest
@@ -22,7 +22,7 @@ func TestClockWithDefinedStartTime(t *testing.T) {
 		wants []time.Time // The return values of sequential calls to Now().
 	}{
 		{
-			name:  "increment ms",
+			name:  "increment-ms",
 			start: time.Unix(12345, 1000),
 			step:  1000,
 			wants: []time.Time{
@@ -33,7 +33,7 @@ func TestClockWithDefinedStartTime(t *testing.T) {
 			},
 		},
 		{
-			name:  "increment second",
+			name:  "increment-second",
 			start: time.Unix(12345, 1000),
 			step:  time.Second,
 			wants: []time.Time{
@@ -44,7 +44,7 @@ func TestClockWithDefinedStartTime(t *testing.T) {
 			},
 		},
 		{
-			name:  "no increment",
+			name:  "no-increment",
 			start: time.Unix(12345, 1000),
 			wants: []time.Time{
 				time.Unix(12345, 1000),
@@ -56,7 +56,6 @@ func TestClockWithDefinedStartTime(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			clock := NewClock(ClockOpts{
@@ -92,7 +91,7 @@ func TestClockWithDefaultStartTime(t *testing.T) {
 		wants []time.Duration // The return values of sequential calls to Now() after added to Start()
 	}{
 		{
-			name: "increment ms",
+			name: "increment-ms",
 			step: 1000,
 			wants: []time.Duration{
 				0,
@@ -102,7 +101,7 @@ func TestClockWithDefaultStartTime(t *testing.T) {
 			},
 		},
 		{
-			name: "increment second",
+			name: "increment-second",
 			step: time.Second,
 			wants: []time.Duration{
 				0 * time.Second,
@@ -112,13 +111,12 @@ func TestClockWithDefaultStartTime(t *testing.T) {
 			},
 		},
 		{
-			name:  "no increment",
+			name:  "no-increment",
 			wants: []time.Duration{0, 0, 0, 0},
 		},
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			clock := NewClock(ClockOpts{
@@ -179,7 +177,7 @@ func TestClockSetStep(t *testing.T) {
 		wants       []time.Time // The return values of sequential calls to Now().
 	}{
 		{
-			name:  "increment ms then s",
+			name:  "increment-ms-then-s",
 			start: time.Unix(12345, 1000),
 			step:  1000,
 			stepChanges: []stepInfo{
@@ -200,7 +198,7 @@ func TestClockSetStep(t *testing.T) {
 			},
 		},
 		{
-			name:  "multiple changes over time",
+			name:  "multiple-changes-over-time",
 			start: time.Unix(12345, 1000),
 			step:  1,
 			stepChanges: []stepInfo{
@@ -229,7 +227,7 @@ func TestClockSetStep(t *testing.T) {
 			},
 		},
 		{
-			name:  "multiple changes at once",
+			name:  "multiple-changes-at-once",
 			start: time.Unix(12345, 1000),
 			step:  1,
 			stepChanges: []stepInfo{
@@ -254,7 +252,7 @@ func TestClockSetStep(t *testing.T) {
 			},
 		},
 		{
-			name:  "changes at start",
+			name:  "changes-at-start",
 			start: time.Unix(12345, 1000),
 			step:  0,
 			stepChanges: []stepInfo{
@@ -277,7 +275,6 @@ func TestClockSetStep(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			clock := NewClock(ClockOpts{
@@ -328,7 +325,7 @@ func TestClockAdvance(t *testing.T) {
 		wants    []time.Time // The return values of sequential calls to Now().
 	}{
 		{
-			name:  "increment ms then advance 1s",
+			name:  "increment-ms-then-advance-1s",
 			start: time.Unix(12345, 1000),
 			step:  1000,
 			advances: []advanceInfo{
@@ -349,7 +346,7 @@ func TestClockAdvance(t *testing.T) {
 			},
 		},
 		{
-			name:  "multiple advances over time",
+			name:  "multiple-advances-over-time",
 			start: time.Unix(12345, 1000),
 			step:  1,
 			advances: []advanceInfo{
@@ -378,7 +375,7 @@ func TestClockAdvance(t *testing.T) {
 			},
 		},
 		{
-			name:  "multiple advances at once",
+			name:  "multiple-advances-at-once",
 			start: time.Unix(12345, 1000),
 			step:  1,
 			advances: []advanceInfo{
@@ -403,7 +400,7 @@ func TestClockAdvance(t *testing.T) {
 			},
 		},
 		{
-			name:  "changes at start",
+			name:  "changes-at-start",
 			start: time.Unix(12345, 1000),
 			step:  5,
 			advances: []advanceInfo{
@@ -426,7 +423,6 @@ func TestClockAdvance(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			clock := NewClock(ClockOpts{
@@ -493,7 +489,7 @@ func TestSingleTicker(t *testing.T) {
 		steps        []testStep
 	}{
 		{
-			name:   "no tick advance",
+			name:   "no-tick-advance",
 			start:  time.Unix(12345, 0),
 			period: time.Second,
 			steps: []testStep{
@@ -504,7 +500,7 @@ func TestSingleTicker(t *testing.T) {
 			},
 		},
 		{
-			name:   "no tick step",
+			name:   "no-tick-step",
 			start:  time.Unix(12345, 0),
 			step:   time.Second - 1,
 			period: time.Second,
@@ -518,7 +514,7 @@ func TestSingleTicker(t *testing.T) {
 			},
 		},
 		{
-			name:   "single tick advance exact",
+			name:   "single-tick-advance-exact",
 			start:  time.Unix(12345, 0),
 			period: time.Second,
 			steps: []testStep{
@@ -530,7 +526,7 @@ func TestSingleTicker(t *testing.T) {
 			},
 		},
 		{
-			name:   "single tick advance extra",
+			name:   "single-tick-advance-extra",
 			start:  time.Unix(12345, 0),
 			period: time.Second,
 			steps: []testStep{
@@ -542,7 +538,7 @@ func TestSingleTicker(t *testing.T) {
 			},
 		},
 		{
-			name:   "single tick step exact",
+			name:   "single-tick-step-exact",
 			start:  time.Unix(12345, 0),
 			step:   time.Second,
 			period: time.Second,
@@ -557,7 +553,7 @@ func TestSingleTicker(t *testing.T) {
 			},
 		},
 		{
-			name:   "single tick step extra",
+			name:   "single-tick-step-extra",
 			start:  time.Unix(12345, 0),
 			step:   time.Second + 1,
 			period: time.Second,
@@ -572,7 +568,7 @@ func TestSingleTicker(t *testing.T) {
 			},
 		},
 		{
-			name:   "single tick per advance",
+			name:   "single-tick-per-advance",
 			start:  time.Unix(12345, 0),
 			period: 3 * time.Second,
 			steps: []testStep{
@@ -601,7 +597,7 @@ func TestSingleTicker(t *testing.T) {
 			},
 		},
 		{
-			name:   "single tick per step",
+			name:   "single-tick-per-step",
 			start:  time.Unix(12345, 0),
 			step:   2 * time.Second,
 			period: 3 * time.Second,
@@ -630,7 +626,7 @@ func TestSingleTicker(t *testing.T) {
 			},
 		},
 		{
-			name:        "multiple tick per advance",
+			name:        "multiple-tick-per-advance",
 			start:       time.Unix(12345, 0),
 			period:      time.Second,
 			channelSize: 3,
@@ -659,7 +655,7 @@ func TestSingleTicker(t *testing.T) {
 			},
 		},
 		{
-			name:        "multiple tick per step",
+			name:        "multiple-tick-per-step",
 			start:       time.Unix(12345, 0),
 			step:        3 * time.Second,
 			period:      2 * time.Second,
@@ -727,7 +723,7 @@ func TestSingleTicker(t *testing.T) {
 			},
 		},
 		{
-			name:   "reset while running",
+			name:   "reset-while-running",
 			start:  time.Unix(12345, 0),
 			period: 2 * time.Second,
 			steps: []testStep{
@@ -767,7 +763,7 @@ func TestSingleTicker(t *testing.T) {
 			},
 		},
 		{
-			name:   "reset while stopped",
+			name:   "reset-while-stopped",
 			start:  time.Unix(12345, 0),
 			step:   time.Second,
 			period: 2 * time.Second,
@@ -807,7 +803,7 @@ func TestSingleTicker(t *testing.T) {
 			},
 		},
 		{
-			name:   "reset absolute",
+			name:   "reset-absolute",
 			start:  time.Unix(12345, 0),
 			step:   time.Second,
 			period: 2 * time.Second,
@@ -845,7 +841,7 @@ func TestSingleTicker(t *testing.T) {
 			},
 		},
 		{
-			name:         "follow real time",
+			name:         "follow-real-time",
 			realTimeOpts: new(ClockOpts),
 			start:        time.Unix(12345, 0),
 			period:       2 * time.Second,
@@ -876,7 +872,6 @@ func TestSingleTicker(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			var realTimeClockForTestClock tstime.Clock
@@ -970,7 +965,7 @@ func TestSingleTimer(t *testing.T) {
 		steps        []testStep
 	}{
 		{
-			name:  "no tick advance",
+			name:  "no-tick-advance",
 			start: time.Unix(12345, 0),
 			delay: time.Second,
 			steps: []testStep{
@@ -981,7 +976,7 @@ func TestSingleTimer(t *testing.T) {
 			},
 		},
 		{
-			name:  "no tick step",
+			name:  "no-tick-step",
 			start: time.Unix(12345, 0),
 			step:  time.Second - 1,
 			delay: time.Second,
@@ -995,7 +990,7 @@ func TestSingleTimer(t *testing.T) {
 			},
 		},
 		{
-			name:  "single tick advance exact",
+			name:  "single-tick-advance-exact",
 			start: time.Unix(12345, 0),
 			delay: time.Second,
 			steps: []testStep{
@@ -1011,7 +1006,7 @@ func TestSingleTimer(t *testing.T) {
 			},
 		},
 		{
-			name:  "single tick advance extra",
+			name:  "single-tick-advance-extra",
 			start: time.Unix(12345, 0),
 			delay: time.Second,
 			steps: []testStep{
@@ -1027,7 +1022,7 @@ func TestSingleTimer(t *testing.T) {
 			},
 		},
 		{
-			name:  "single tick step exact",
+			name:  "single-tick-step-exact",
 			start: time.Unix(12345, 0),
 			step:  time.Second,
 			delay: time.Second,
@@ -1045,7 +1040,7 @@ func TestSingleTimer(t *testing.T) {
 			},
 		},
 		{
-			name:  "single tick step extra",
+			name:  "single-tick-step-extra",
 			start: time.Unix(12345, 0),
 			step:  time.Second + 1,
 			delay: time.Second,
@@ -1063,7 +1058,7 @@ func TestSingleTimer(t *testing.T) {
 			},
 		},
 		{
-			name:  "reset for single tick per advance",
+			name:  "reset-for-single-tick-per-advance",
 			start: time.Unix(12345, 0),
 			delay: 3 * time.Second,
 			steps: []testStep{
@@ -1098,7 +1093,7 @@ func TestSingleTimer(t *testing.T) {
 			},
 		},
 		{
-			name:  "reset for single tick per step",
+			name:  "reset-for-single-tick-per-step",
 			start: time.Unix(12345, 0),
 			step:  2 * time.Second,
 			delay: 3 * time.Second,
@@ -1129,7 +1124,7 @@ func TestSingleTimer(t *testing.T) {
 			},
 		},
 		{
-			name:  "reset while active",
+			name:  "reset-while-active",
 			start: time.Unix(12345, 0),
 			step:  2 * time.Second,
 			delay: 3 * time.Second,
@@ -1160,7 +1155,7 @@ func TestSingleTimer(t *testing.T) {
 			},
 		},
 		{
-			name:  "stop after fire",
+			name:  "stop-after-fire",
 			start: time.Unix(12345, 0),
 			step:  2 * time.Second,
 			delay: time.Second,
@@ -1186,7 +1181,7 @@ func TestSingleTimer(t *testing.T) {
 			},
 		},
 		{
-			name:  "stop before fire",
+			name:  "stop-before-fire",
 			start: time.Unix(12345, 0),
 			step:  2 * time.Second,
 			delay: time.Second,
@@ -1212,7 +1207,7 @@ func TestSingleTimer(t *testing.T) {
 			},
 		},
 		{
-			name:  "stop after reset",
+			name:  "stop-after-reset",
 			start: time.Unix(12345, 0),
 			step:  2 * time.Second,
 			delay: time.Second,
@@ -1240,7 +1235,7 @@ func TestSingleTimer(t *testing.T) {
 			},
 		},
 		{
-			name:  "reset while running",
+			name:  "reset-while-running",
 			start: time.Unix(12345, 0),
 			delay: 2 * time.Second,
 			steps: []testStep{
@@ -1280,7 +1275,7 @@ func TestSingleTimer(t *testing.T) {
 			},
 		},
 		{
-			name:  "reset while stopped",
+			name:  "reset-while-stopped",
 			start: time.Unix(12345, 0),
 			step:  time.Second,
 			delay: 2 * time.Second,
@@ -1315,7 +1310,7 @@ func TestSingleTimer(t *testing.T) {
 			},
 		},
 		{
-			name:  "reset absolute",
+			name:  "reset-absolute",
 			start: time.Unix(12345, 0),
 			step:  time.Second,
 			delay: 2 * time.Second,
@@ -1349,7 +1344,7 @@ func TestSingleTimer(t *testing.T) {
 			},
 		},
 		{
-			name:         "follow real time",
+			name:         "follow-real-time",
 			realTimeOpts: new(ClockOpts),
 			start:        time.Unix(12345, 0),
 			delay:        2 * time.Second,
@@ -1377,7 +1372,6 @@ func TestSingleTimer(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			var realTimeClockForTestClock tstime.Clock
@@ -1711,7 +1705,7 @@ func TestClockFollowRealTime(t *testing.T) {
 		wants             []time.Time // The return values of sequential calls to Now().
 	}{
 		{
-			name:      "increment ms then advance 1s",
+			name:      "increment-ms-then-advance-1s",
 			start:     time.Unix(12345, 1000),
 			wantStart: time.Unix(12345, 1000),
 			advances: []advanceInfo{
@@ -1756,7 +1750,7 @@ func TestClockFollowRealTime(t *testing.T) {
 			},
 		},
 		{
-			name:      "multiple advances over time",
+			name:      "multiple-advances-over-time",
 			start:     time.Unix(12345, 1000),
 			wantStart: time.Unix(12345, 1000),
 			advances: []advanceInfo{
@@ -1801,7 +1795,7 @@ func TestClockFollowRealTime(t *testing.T) {
 			},
 		},
 		{
-			name:      "multiple advances at once",
+			name:      "multiple-advances-at-once",
 			start:     time.Unix(12345, 1000),
 			wantStart: time.Unix(12345, 1000),
 			advances: []advanceInfo{
@@ -1834,7 +1828,7 @@ func TestClockFollowRealTime(t *testing.T) {
 			},
 		},
 		{
-			name:      "changes at start",
+			name:      "changes-at-start",
 			start:     time.Unix(12345, 1000),
 			wantStart: time.Unix(12345, 1000),
 			advances: []advanceInfo{
@@ -1867,7 +1861,7 @@ func TestClockFollowRealTime(t *testing.T) {
 			},
 		},
 		{
-			name: "start from current time",
+			name: "start-from-current-time",
 			realTimeClockOpts: ClockOpts{
 				Start: time.Unix(12345, 0),
 			},
@@ -1911,7 +1905,6 @@ func TestClockFollowRealTime(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			realTimeClock := NewClock(tt.realTimeClockOpts)
@@ -1973,7 +1966,7 @@ func TestAfterFunc(t *testing.T) {
 		steps        []testStep
 	}{
 		{
-			name:  "no tick advance",
+			name:  "no-tick-advance",
 			start: time.Unix(12345, 0),
 			delay: time.Second,
 			steps: []testStep{
@@ -1984,7 +1977,7 @@ func TestAfterFunc(t *testing.T) {
 			},
 		},
 		{
-			name:  "no tick step",
+			name:  "no-tick-step",
 			start: time.Unix(12345, 0),
 			step:  time.Second - 1,
 			delay: time.Second,
@@ -1998,7 +1991,7 @@ func TestAfterFunc(t *testing.T) {
 			},
 		},
 		{
-			name:  "single tick advance exact",
+			name:  "single-tick-advance-exact",
 			start: time.Unix(12345, 0),
 			delay: time.Second,
 			steps: []testStep{
@@ -2014,7 +2007,7 @@ func TestAfterFunc(t *testing.T) {
 			},
 		},
 		{
-			name:  "single tick advance extra",
+			name:  "single-tick-advance-extra",
 			start: time.Unix(12345, 0),
 			delay: time.Second,
 			steps: []testStep{
@@ -2030,7 +2023,7 @@ func TestAfterFunc(t *testing.T) {
 			},
 		},
 		{
-			name:  "single tick step exact",
+			name:  "single-tick-step-exact",
 			start: time.Unix(12345, 0),
 			step:  time.Second,
 			delay: time.Second,
@@ -2048,7 +2041,7 @@ func TestAfterFunc(t *testing.T) {
 			},
 		},
 		{
-			name:  "single tick step extra",
+			name:  "single-tick-step-extra",
 			start: time.Unix(12345, 0),
 			step:  time.Second + 1,
 			delay: time.Second,
@@ -2066,7 +2059,7 @@ func TestAfterFunc(t *testing.T) {
 			},
 		},
 		{
-			name:  "reset for single tick per advance",
+			name:  "reset-for-single-tick-per-advance",
 			start: time.Unix(12345, 0),
 			delay: 3 * time.Second,
 			steps: []testStep{
@@ -2101,7 +2094,7 @@ func TestAfterFunc(t *testing.T) {
 			},
 		},
 		{
-			name:  "reset for single tick per step",
+			name:  "reset-for-single-tick-per-step",
 			start: time.Unix(12345, 0),
 			step:  2 * time.Second,
 			delay: 3 * time.Second,
@@ -2132,7 +2125,7 @@ func TestAfterFunc(t *testing.T) {
 			},
 		},
 		{
-			name:  "reset while active",
+			name:  "reset-while-active",
 			start: time.Unix(12345, 0),
 			step:  2 * time.Second,
 			delay: 3 * time.Second,
@@ -2163,7 +2156,7 @@ func TestAfterFunc(t *testing.T) {
 			},
 		},
 		{
-			name:  "stop after fire",
+			name:  "stop-after-fire",
 			start: time.Unix(12345, 0),
 			step:  2 * time.Second,
 			delay: time.Second,
@@ -2189,7 +2182,7 @@ func TestAfterFunc(t *testing.T) {
 			},
 		},
 		{
-			name:  "stop before fire",
+			name:  "stop-before-fire",
 			start: time.Unix(12345, 0),
 			step:  2 * time.Second,
 			delay: time.Second,
@@ -2215,7 +2208,7 @@ func TestAfterFunc(t *testing.T) {
 			},
 		},
 		{
-			name:  "stop after reset",
+			name:  "stop-after-reset",
 			start: time.Unix(12345, 0),
 			step:  2 * time.Second,
 			delay: time.Second,
@@ -2243,7 +2236,7 @@ func TestAfterFunc(t *testing.T) {
 			},
 		},
 		{
-			name:  "reset while running",
+			name:  "reset-while-running",
 			start: time.Unix(12345, 0),
 			delay: 2 * time.Second,
 			steps: []testStep{
@@ -2277,7 +2270,7 @@ func TestAfterFunc(t *testing.T) {
 			},
 		},
 		{
-			name:  "reset while stopped",
+			name:  "reset-while-stopped",
 			start: time.Unix(12345, 0),
 			step:  time.Second,
 			delay: 2 * time.Second,
@@ -2310,7 +2303,7 @@ func TestAfterFunc(t *testing.T) {
 			},
 		},
 		{
-			name:  "reset absolute",
+			name:  "reset-absolute",
 			start: time.Unix(12345, 0),
 			step:  time.Second,
 			delay: 2 * time.Second,
@@ -2340,7 +2333,7 @@ func TestAfterFunc(t *testing.T) {
 			},
 		},
 		{
-			name:         "follow real time",
+			name:         "follow-real-time",
 			realTimeOpts: new(ClockOpts),
 			start:        time.Unix(12345, 0),
 			delay:        2 * time.Second,
@@ -2364,7 +2357,6 @@ func TestAfterFunc(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			var realTimeClockForTestClock tstime.Clock
@@ -2468,7 +2460,6 @@ func TestSince(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			clock := NewClock(ClockOpts{

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 import { useCallback } from "react"
@@ -123,7 +123,10 @@ export function useAPI() {
           return apiFetch<{ url?: string }>("/up", "POST", t.data)
             .then((d) => d.url && window.open(d.url, "_blank")) // "up" login step
             .then(() => incrementMetric("web_client_node_connect"))
-            .then(() => mutate("/data"))
+            .then(() => {
+              mutate("/data")
+              mutate("/auth")
+            })
             .catch(handlePostError("Failed to login"))
 
         /**
@@ -134,9 +137,9 @@ export function useAPI() {
           // For logout, must increment metric before running api call,
           // as tailscaled will be unreachable after the call completes.
           incrementMetric("web_client_node_disconnect")
-          return apiFetch("/local/v0/logout", "POST").catch(
-            handlePostError("Failed to logout")
-          )
+          return apiFetch("/local/v0/logout", "POST")
+            .then(() => mutate("/auth"))
+            .catch(handlePostError("Failed to logout"))
 
         /**
          * "new-auth-session" handles creating a new check mode session to
@@ -249,7 +252,6 @@ export function useAPI() {
   return api
 }
 
-let csrfToken: string
 let synoToken: string | undefined // required for synology API requests
 let unraidCsrfToken: string | undefined // required for unraid POST requests (#8062)
 
@@ -298,12 +300,10 @@ export function apiFetch<T>(
     headers: {
       Accept: "application/json",
       "Content-Type": contentType,
-      "X-CSRF-Token": csrfToken,
     },
     body: body,
   })
     .then((r) => {
-      updateCsrfToken(r)
       if (!r.ok) {
         return r.text().then((err) => {
           throw new Error(err)
@@ -320,13 +320,6 @@ export function apiFetch<T>(
       r?.UnraidToken && setUnraidCsrfToken(r.UnraidToken)
       return r
     })
-}
-
-function updateCsrfToken(r: Response) {
-  const tok = r.headers.get("X-CSRF-Token")
-  if (tok) {
-    csrfToken = tok
-  }
 }
 
 export function setSynoToken(token?: string) {

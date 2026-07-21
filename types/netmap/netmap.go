@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package netmap contains the netmap.NetworkMap type.
@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tka"
 	"tailscale.com/types/key"
@@ -26,14 +27,11 @@ import (
 // The fields should all be considered read-only. They might
 // alias parts of previous NetworkMap values.
 type NetworkMap struct {
-	SelfNode   tailcfg.NodeView
-	AllCaps    set.Set[tailcfg.NodeCapability] // set version of SelfNode.Capabilities + SelfNode.CapMap
-	NodeKey    key.NodePublic
-	PrivateKey key.NodePrivate
-	Expiry     time.Time
-	// Name is the DNS name assigned to this node.
-	// It is the MapResponse.Node.Name value and ends with a period.
-	Name string
+	Cached bool // whether this NetworkMap was loaded from disk cache (as opposed to live from network)
+
+	SelfNode tailcfg.NodeView
+	AllCaps  set.Set[tailcfg.NodeCapability] // set version of SelfNode.Capabilities + SelfNode.CapMap
+	NodeKey  key.NodePublic
 
 	MachineKey key.MachinePublic
 
@@ -54,12 +52,12 @@ type NetworkMap struct {
 	// between updates and should not be modified.
 	DERPMap *tailcfg.DERPMap
 
-	// ControlHealth are the list of health check problems for this
+	// DisplayMessages are the list of health check problems for this
 	// node from the perspective of the control plane.
 	// If empty, there are no known problems from the control plane's
 	// point of view, but the node might know about its own health
 	// check problems.
-	ControlHealth []string
+	DisplayMessages map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage
 
 	// TKAEnabled indicates whether the tailnet key authority should be
 	// enabled, from the perspective of the control plane.
@@ -148,6 +146,34 @@ func (nm *NetworkMap) GetIPVIPServiceMap() IPServiceMappings {
 	return res
 }
 
+// Services returns the Services visible (accessible) to this node,
+// decoded from [tailcfg.NodeAttrPrefixServices] entries in the self node's
+// CapMap. The returned map is keyed by [tailcfg.ServiceDetails.Name],
+// which is the canonical service name. It returns nil if nm is nil
+// or SelfNode is invalid.
+//
+// TODO(adrianosela): cache the result of decoding the capmap so
+// we don't have to decode it multiple times after each netmap update.
+func (nm *NetworkMap) Services() map[tailcfg.ServiceName]tailcfg.ServiceDetails {
+	if nm == nil || !nm.SelfNode.Valid() {
+		return nil
+	}
+	result := make(map[tailcfg.ServiceName]tailcfg.ServiceDetails)
+	for cap := range nm.SelfNode.CapMap().All() {
+		if !strings.HasPrefix(string(cap), string(tailcfg.NodeAttrPrefixServices)) {
+			continue
+		}
+		svcs, err := tailcfg.UnmarshalNodeCapViewJSON[tailcfg.ServiceDetails](nm.SelfNode.CapMap(), cap)
+		if err != nil || len(svcs) < 1 {
+			continue
+		}
+		// NOTE(adrianosela): the NodeCapMap key suffix is opaque and MUST not
+		// be parsed or relied upon (so we extract name from the inner field).
+		result[svcs[0].Name] = svcs[0]
+	}
+	return result
+}
+
 // SelfNodeOrZero returns the self node, or a zero value if nm is nil.
 func (nm *NetworkMap) SelfNodeOrZero() tailcfg.NodeView {
 	if nm == nil {
@@ -159,8 +185,11 @@ func (nm *NetworkMap) SelfNodeOrZero() tailcfg.NodeView {
 // AnyPeersAdvertiseRoutes reports whether any peer is advertising non-exit node routes.
 func (nm *NetworkMap) AnyPeersAdvertiseRoutes() bool {
 	for _, p := range nm.Peers {
-		if p.PrimaryRoutes().Len() > 0 {
-			return true
+		// NOTE: (ChaosInTheCRD) if the peer being advertised is a tailscale ip, we ignore it in this check
+		for _, r := range p.PrimaryRoutes().All() {
+			if !tsaddr.IsTailscaleIP(r.Addr()) || !r.IsSingleIP() {
+				return true
+			}
 		}
 	}
 	return false
@@ -236,10 +265,25 @@ func MagicDNSSuffixOfNodeName(nodeName string) string {
 //
 // It will neither start nor end with a period.
 func (nm *NetworkMap) MagicDNSSuffix() string {
-	if nm == nil {
+	return MagicDNSSuffixOfNodeName(nm.SelfName())
+}
+
+// SelfName returns nm.SelfNode.Name, or the empty string
+// if nm is nil or nm.SelfNode is invalid.
+func (nm *NetworkMap) SelfName() string {
+	if nm == nil || !nm.SelfNode.Valid() {
 		return ""
 	}
-	return MagicDNSSuffixOfNodeName(nm.Name)
+	return nm.SelfNode.Name()
+}
+
+// SelfKeyExpiry returns nm.SelfNode.KeyExpiry, or the zero
+// value if nil or nm.SelfNode is invalid.
+func (nm *NetworkMap) SelfKeyExpiry() time.Time {
+	if nm == nil || !nm.SelfNode.Valid() {
+		return time.Time{}
+	}
+	return nm.SelfNode.KeyExpiry()
 }
 
 // DomainName returns the name of the NetworkMap's
@@ -252,11 +296,20 @@ func (nm *NetworkMap) DomainName() string {
 	return nm.Domain
 }
 
-// HasSelfCapability reports whether nm.SelfNode contains capability c.
-//
-// It exists to satisify an unused (as of 2025-01-04) interface in the logknob package.
-func (nm *NetworkMap) HasSelfCapability(c tailcfg.NodeCapability) bool {
-	return nm.AllCaps.Contains(c)
+// TailnetDisplayName returns the admin-editable name contained in
+// NodeAttrTailnetDisplayName. If the capability is not present it
+// returns an empty string.
+func (nm *NetworkMap) TailnetDisplayName() string {
+	if nm == nil || !nm.SelfNode.Valid() {
+		return ""
+	}
+
+	tailnetDisplayNames, err := tailcfg.UnmarshalNodeCapViewJSON[string](nm.SelfNode.CapMap(), tailcfg.NodeAttrTailnetDisplayName)
+	if err != nil || len(tailnetDisplayNames) == 0 {
+		return ""
+	}
+
+	return tailnetDisplayNames[0]
 }
 
 func (nm *NetworkMap) String() string {

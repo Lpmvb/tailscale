@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package captivedetection provides a way to detect if the system is connected to a network that has
@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"tailscale.com/net/netmon"
+	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
 )
@@ -32,7 +33,7 @@ type Detector struct {
 	// currIfIndex is the index of the interface that is currently being used by the httpClient.
 	currIfIndex int
 	// mu guards currIfIndex.
-	mu sync.Mutex
+	mu syncs.Mutex
 	// logf is the logger used for logging messages. If it is nil, log.Printf is used.
 	logf logger.Logf
 }
